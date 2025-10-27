@@ -648,6 +648,16 @@ async def main():
         print("Bot:", out.get("reply", ""))
         # Debug (optional):
         # print("[debug] intent:", out.get("intent"), "| profile:", profile)
+# --- Convenience entrypoint for webhooks ---
+async def handle_turn(question: str, profile: Dict[str, str]) -> tuple[str, Dict[str, str]]:
+    """
+    Runs one turn through the graph and returns (reply_text, new_profile).
+    Safe to call from FastAPI/Flask handlers.
+    """
+    result = await app_graph.ainvoke({"question": question, "profile": profile or {}})
+    reply = (result.get("reply") or "").strip()
+    new_profile = result.get("profile", profile or {})
+    return reply, new_profile
 
 if __name__ == "__main__":
     print(mermaid_diagram())     # copy into mermaid.live to visualize the flow
