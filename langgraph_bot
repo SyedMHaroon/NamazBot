@@ -1,0 +1,24 @@
+digraph LangGraphBot {
+	fontsize=20 labelloc=t rankdir=LR
+	start [label=entry shape=circle]
+	ensure_profile [label=ensure_profile]
+	noop [label="noop (ask next field & END)" shape=box]
+	classify [label=classify]
+	islamic_date [label=islamic_date]
+	prayer_times [label=prayer_times]
+	next_prayer [label=next_prayer]
+	general [label=general]
+	END [label=END shape=doublecircle]
+	start -> ensure_profile
+	ensure_profile -> noop [label="missing fields"]
+	ensure_profile -> classify [label=complete]
+	classify -> islamic_date [label=islamic_date]
+	classify -> prayer_times [label=prayer_times]
+	classify -> next_prayer [label=next_prayer]
+	classify -> general [label=general]
+	islamic_date -> END
+	prayer_times -> END
+	next_prayer -> END
+	general -> END
+	noop -> END
+}
