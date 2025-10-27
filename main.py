@@ -52,6 +52,31 @@ class BotState(TypedDict, total=False):
 # -------------------------
 RE_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+async def aladhan_fetch(city: Optional[str], country: Optional[str], date: Optional[str] = None) -> Dict[str, Any]:
+    """
+    If both city and country are present -> use timingsByCity.
+    If only city is present -> use timingsByAddress (no guessing a country).
+    """
+    if not city:
+        raise ValueError("aladhan_fetch requires at least a city.")
+
+    base_params = {"method": 2}
+    if date:
+        base_params["date"] = date
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+        if city and country:
+            url = "https://api.aladhan.com/v1/timingsByCity"
+            params = {**base_params, "city": city, "country": country}
+        else:
+            url = "https://api.aladhan.com/v1/timingsByAddress"
+            params = {**base_params, "address": city}
+
+        r = await c.get(url, params=params)
+        r.raise_for_status()
+        return r.json()["data"]
+
+
 async def aladhan(city: str, country: str, date: Optional[str] = None) -> Dict[str, Any]:
     url = "https://api.aladhan.com/v1/timingsByCity"
     params = {"city": city, "country": country, "method": 2}
@@ -116,6 +141,64 @@ def parse_city_country(line: str) -> tuple[Optional[str], Optional[str]]:
         return city, None  # city might be fine but country unknown
     return city, country_norm
 
+def find_country_in_text(text: str) -> Optional[str]:
+    """Return normalized country name ONLY if the user explicitly typed it."""
+    if not text:
+        return None
+    t = text.lower()
+
+    alias_map = {
+        "ksa": "Saudi Arabia",
+        "uae": "United Arab Emirates",
+        "uk": "United Kingdom",
+        "usa": "United States",
+        "us": "United States",
+        "pk": "Pakistan",
+    }
+    for alias, fullname in alias_map.items():
+        if re.search(rf"\b{re.escape(alias)}\b", t):
+            return fullname
+
+    try:
+        for c in pycountry.countries:
+            name = c.name.lower()
+            if re.search(rf"\b{re.escape(name)}\b", t):
+                return c.name
+            if hasattr(c, "common_name"):
+                cname = c.common_name.lower()
+                if re.search(rf"\b{re.escape(cname)}\b", t):
+                    return c.common_name
+    except Exception:
+        pass
+    return None
+def get_effective_location(state: BotState) -> tuple[Optional[str], Optional[str], bool]:
+    """
+    Returns (city, country, address_mode).
+    - address_mode=True => we will query Aladhan by address (city only) and NOT append a country in the reply.
+    - If the user gave an override city but NOT a country, do NOT fall back to the saved country.
+    - Otherwise use (override if present) else (saved profile) for both.
+    """
+    prof = state.get("profile", {}) or {}
+    o_city = prof.get("_override_city")
+    o_country = prof.get("_override_country")
+    p_city = prof.get("city")
+    p_country = prof.get("country")
+
+    if o_city and not o_country:
+        return o_city, None, True  # address mode (city only)
+
+    city = o_city or p_city
+    country = o_country or p_country
+    return city, country, False  # timingsByCity mode
+
+
+def clear_overrides(state: BotState) -> None:
+    prof = state.get("profile", {}) or {}
+    prof.pop("_override_city", None)
+    prof.pop("_override_country", None)
+    state["profile"] = prof
+
+
 async def validate_location_against_api(city: str, country: str) -> tuple[bool, Optional[str]]:
     """
     Probe Aladhan. Return (ok, timezone). ok only if timings exist AND a timezone is present.
@@ -147,13 +230,17 @@ def _safe_json_extract(text: str) -> dict:
 async def llm_intent_json(question: str) -> dict:
     """
     Ask Gemini for strict JSON: {"intent": "...", "slots": {"prayer_name":..., "date":..., "city":..., "country":...}}
+    IMPORTANT: The model must NOT infer country; only set it if the user explicitly typed it.
     """
     system = (
         "You are a router that ONLY returns strict JSON. No prose, no markdown.\n"
         "Allowed intents: islamic_date, prayer_times, next_prayer, general.\n"
-        "Slots (all optional): prayer_name (Fajr|Dhuhr|Asr|Maghrib|Isha), "
-        "date (today|tomorrow|YYYY-MM-DD), city (string), country (string).\n"
-        "If unsure about a slot, set it to null.\n"
+        "Slots (all optional):\n"
+        "  - prayer_name: Fajr|Dhuhr|Asr|Maghrib|Isha\n"
+        "  - date: today|tomorrow|YYYY-MM-DD\n"
+        "  - city: string (ONLY if user typed a city)\n"
+        "  - country: string (ONLY if user explicitly typed a country; DO NOT GUESS OR INFER)\n"
+        "If unsure about ANY slot, set it to null. DO NOT invent or infer countries.\n"
         "Respond with exactly this JSON schema:\n"
         "{\n"
         "  \"intent\": \"islamic_date|prayer_times|next_prayer|general\",\n"
@@ -176,7 +263,7 @@ async def llm_intent_json(question: str) -> dict:
         slots["prayer_name"] = mapping.get(str(pn).strip().lower(), None)
         if slots["prayer_name"] not in PRAYER_NAMES:
             slots["prayer_name"] = None
-    # normalize city/country
+    # normalize city/country casing only
     for k in ("city","country"):
         if isinstance(slots.get(k), str):
             val = slots[k].strip()
@@ -322,32 +409,42 @@ async def ensure_profile(state: BotState) -> BotState:
 async def classify(state: BotState) -> BotState:
     prof = state.get("profile", {}) or {}
     # Safety: if onboarding isn't complete (or ack just printed), don't route
-    if prof.get("_await") or not _profile_complete(prof) or prof.get("_onboarding_ack"):
-        state["intent"] = "general"  # not used; route_after_profile blocks classify anyway
+    if prof.get("_await") or not _profile_complete(prof) or prof.get("_onboarding_ack") or prof.get("_confirm_loc"):
+        state["intent"] = "general"  # will be short-circuited by route_after_profile -> noop
         return state
 
-    q = state.get("question", "")
+    q = state.get("question", "") or ""
     data = await llm_intent_json(q)
     label = data["intent"]
     slots = data.get("slots", {}) or {}
 
-    # Inline overrides
+    # One-turn overrides (do NOT change saved profile)
+    # City: allow ad-hoc override
     if slots.get("city"):
-        prof["city"] = slots["city"]
-    if slots.get("country"):
-        prof["country"] = slots["country"]
-    state["profile"] = prof
-
-    if slots.get("prayer_name"):
-        state["profile"]["_requested_prayer"] = slots["prayer_name"]
+        prof["_override_city"] = slots["city"]
     else:
-        state["profile"].pop("_requested_prayer", None)
+        prof.pop("_override_city", None)
+
+    # Country: ONLY if explicitly typed in this question
+    explicit_country = find_country_in_text(q)
+    if explicit_country:
+        prof["_override_country"] = normalize_country_name(explicit_country) or explicit_country
+    else:
+        # ignore any LLM country slot unless explicit in text
+        prof.pop("_override_country", None)
+
+    # Optional slots
+    if slots.get("prayer_name"):
+        prof["_requested_prayer"] = slots["prayer_name"]
+    else:
+        prof.pop("_requested_prayer", None)
 
     if slots.get("date"):
-        state["profile"]["_requested_date"] = slots["date"]
+        prof["_requested_date"] = slots["date"]
     else:
-        state["profile"].pop("_requested_date", None)
+        prof.pop("_requested_date", None)
 
+    state["profile"] = prof
     state["intent"] = label
     return state
 
@@ -373,19 +470,21 @@ def mermaid_diagram() -> str:
 # Task nodes
 # -------------------------
 async def islamic_date(state: BotState) -> BotState:
-    city    = state["profile"]["city"]
-    country = state["profile"]["country"]
-    d = await aladhan(city, country)
+    city, country, address_mode = get_effective_location(state)
+    d = await aladhan_fetch(city, country, None)
     hijri = d["date"]["hijri"]["date"]
     greg  = d["date"]["readable"]
-    state["reply"] = f"Islamic (Hijri) date in {city}, {country}: {hijri}\nGregorian: {greg}"
+
+    place = city if (address_mode or not country) else f"{city}, {country}"
+    state["reply"] = f"Islamic (Hijri) date in {place}: {hijri}\nGregorian: {greg}"
+
+    clear_overrides(state)
     return state
 
 async def prayer_times(state: BotState) -> BotState:
-    city    = state["profile"]["city"]
-    country = state["profile"]["country"]
+    city, country, address_mode = get_effective_location(state)
 
-    # date support: today (default). If 'tomorrow' or YYYY-MM-DD requested, use it.
+    # Date selection
     date_req = state["profile"].get("_requested_date")
     date_param: Optional[str] = None
     if date_req:
@@ -393,7 +492,8 @@ async def prayer_times(state: BotState) -> BotState:
         if s == "today":
             date_param = None
         elif s == "tomorrow":
-            tzname = (await aladhan(city, country)).get("meta", {}).get("timezone", "UTC")
+            d0 = await aladhan_fetch(city, country, None)
+            tzname = d0.get("meta", {}).get("timezone", "UTC")
             now = datetime.now(ZoneInfo(tzname))
             date_param = (now + timedelta(days=1)).strftime("%d-%m-%Y")
         else:
@@ -403,23 +503,28 @@ async def prayer_times(state: BotState) -> BotState:
             except Exception:
                 date_param = None
 
-    d = await aladhan(city, country, date_param)
+    d = await aladhan_fetch(city, country, date_param)
     t = {k: clean_time(v) for k, v in d["timings"].items()}
     req = state["profile"].get("_requested_prayer")
 
+    place = city if (address_mode or not country) else f"{city}, {country}"
+
     if req in PRAYER_NAMES:
-        state["reply"] = f"{req} time in {city}, {country}: {t.get(req, 'N/A')}"
+        state["reply"] = f"{req} time in {place}: {t.get(req, 'N/A')}"
+        clear_overrides(state)
         return state
 
     lines = [f"{k}: {t.get(k, 'N/A')}" for k in PRAYER_ORDER]
     when = "today" if not date_param else (state["profile"].get("_requested_date") or "the selected date")
-    state["reply"] = f"Prayer times {when} for {city}, {country}:\n" + "\n".join(lines)
+    state["reply"] = f"Prayer times {when} for {place}:\n" + "\n".join(lines)
+
+    clear_overrides(state)
     return state
 
 async def next_prayer(state: BotState) -> BotState:
-    city    = state["profile"]["city"]
-    country = state["profile"]["country"]
-    d = await aladhan(city, country)
+    city, country, address_mode = get_effective_location(state)
+
+    d = await aladhan_fetch(city, country, None)
     tzname = d.get("meta", {}).get("timezone", "UTC")
     tz     = ZoneInfo(tzname)
     now    = datetime.now(tz)
@@ -436,9 +541,9 @@ async def next_prayer(state: BotState) -> BotState:
             break
 
     if not nxt_name:
-        # after Isha → fetch tomorrow's Fajr
+        # after Isha → tomorrow's Fajr
         tomorrow = (now + timedelta(days=1)).strftime("%d-%m-%Y")
-        d2 = await aladhan(city, country, tomorrow)
+        d2 = await aladhan_fetch(city, country, tomorrow)
         fajr = clean_time(d2["timings"]["Fajr"])
         h, m = map(int, fajr.split(":"))
         nxt_name = "Fajr"
@@ -446,7 +551,11 @@ async def next_prayer(state: BotState) -> BotState:
 
     rem = nxt_time - now
     hours, rem_mins = divmod(int(rem.total_seconds()) // 60, 60)
-    state["reply"] = f"Next prayer in {city}, {country}: {nxt_name} at {nxt_time.strftime('%H:%M')} ({hours}h {rem_mins}m left)"
+
+    place = city if (address_mode or not country) else f"{city}, {country}"
+    state["reply"] = f"Next prayer in {place}: {nxt_name} at {nxt_time.strftime('%H:%M')} ({hours}h {rem_mins}m left)"
+
+    clear_overrides(state)
     return state
 
 async def general(state: BotState) -> BotState:
