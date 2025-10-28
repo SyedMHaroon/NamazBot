@@ -5,3 +5,7 @@ pydantic
 langgraph
 langchain
 google-generativeai
+pycountry
+ffmpeg-python
+faster-whisper
+apscheduler
