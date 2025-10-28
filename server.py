@@ -13,6 +13,7 @@ load_dotenv()
 from voice_pipeline import stt_from_opus, tts_elevenlabs
 from wa_client import send_whatsapp_text, send_whatsapp_audio
 from session_store import get_profile, set_profile
+from formatting import normalize_for_tts
 
 # LangGraph turn handler
 from main import handle_turn
@@ -128,10 +129,13 @@ async def whatsapp_inbound(request: Request):
                         # Run one turn
                         profile = get_profile(wa_from)
                         reply_text, new_profile = await handle_turn(text, profile)
-
-                        # Persist + reply
                         set_profile(wa_from, new_profile)
-                        await send_whatsapp_text(wa_from, reply_text or "…")
+
+                        # 👇 NEW: normalize dates/prayer names for text too
+                        lang_pref = (new_profile or {}).get("lang") or (profile or {}).get("lang") or "en"
+                        reply_text_norm = normalize_for_tts(reply_text or "", lang_pref)
+
+                        await send_whatsapp_text(wa_from, reply_text_norm or "…")
                         continue
 
                     # ---- VOICE NOTE / AUDIO ----
@@ -169,10 +173,12 @@ async def whatsapp_inbound(request: Request):
                             profile = get_profile(wa_from)
                             reply_text, new_profile = await handle_turn(stt_text, profile)
                             set_profile(wa_from, new_profile)
+                            
+                            reply_for_tts = normalize_for_tts(reply_text or "", lang)
 
                             # 4) TTS → audio (fallback to text if TTS fails)
                             try:
-                                mp3 = await tts_elevenlabs(reply_text)
+                                mp3 = await tts_elevenlabs(reply_for_tts)
                                 if mp3:
                                     await send_whatsapp_audio(wa_from, mp3)
                                 else:
