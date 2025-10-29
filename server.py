@@ -1,5 +1,6 @@
 # server.py
 import os
+import re
 from typing import Any, Dict
 
 import httpx
@@ -18,19 +19,75 @@ from formatting import normalize_for_tts
 # LangGraph turn handler
 from main import handle_turn
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
+VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "")
+WHATSAPP_TOKEN  = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")  # optional: EN→AR translate
 
 WABASE = "https://graph.facebook.com/v20.0"
 
 app = FastAPI()
 
+# ---------- language helpers ----------
+ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 
+def detect_lang_from_text(s: str) -> str:
+    """Return 'ar' if Arabic letters present, else 'en'."""
+    if s and ARABIC_RE.search(s):
+        return "ar"
+    return "en"
+
+def has_arabic(s: str) -> bool:
+    return bool(s and ARABIC_RE.search(s))
+
+def is_supported_lang(lang: str) -> bool:
+    return (lang or "").lower() in ("en", "ar")
+
+UNSUPPORTED_LANG_MSG = (
+    "I currently support only English and Arabic. "
+    "Please send your message in English or Arabic.\n\n"
+    "أنا أدعم حاليًا اللغتين الإنجليزية والعربية فقط. "
+    "من فضلك اكتب رسالتك باللغة الإنجليزية أو العربية."
+)
+
+async def translate_to_ar_gemini(text: str) -> str:
+    """
+    Translate English → Arabic using Gemini (if key present).
+    Returns original text if key missing or on error.
+    """
+    if not GEMINI_API_KEY or not text:
+        return text
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    prompt = (
+        "Translate the following into clear Modern Standard Arabic. "
+        "Keep numbers and proper nouns as-is. No commentary, no transliteration, no diacritics.\n\n"
+        f"{text}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 512},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            out = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+            ).strip()
+            return out or text
+    except Exception as e:
+        print("Gemini translate error:", e)
+        return text
+
+# ---------- health & verification ----------
 @app.get("/")
 async def health():
     return {"status": "ok"}
-
 
 @app.get("/webhook")
 async def whatsapp_verify(request: Request):
@@ -47,15 +104,10 @@ async def whatsapp_verify(request: Request):
 
     return PlainTextResponse("Verification failed", status_code=403)
 
-
+# ---------- helpers ----------
 def extract_text(msg: Dict[str, Any]) -> str:
     """
     Supports text and interactive messages (buttons/lists).
-    WhatsApp Cloud API message formats:
-      - type == "text": msg["text"]["body"]
-      - interactive button: msg["interactive"]["button_reply"]["title"]
-      - interactive list:   msg["interactive"]["list_reply"]["title"]
-      - older button type:  msg.get("button", {}).get("text")
     """
     mtype = msg.get("type")
 
@@ -70,12 +122,10 @@ def extract_text(msg: Dict[str, Any]) -> str:
         if itype == "list_reply":
             return (i.get("list_reply", {}) or {}).get("title", "").strip()
 
-    # Some older/alt payloads
     if "button" in msg:
         return (msg.get("button", {}) or {}).get("text", "").strip()
 
     return ""
-
 
 async def fetch_whatsapp_media_bytes(media_id: str) -> bytes:
     """
@@ -95,26 +145,24 @@ async def fetch_whatsapp_media_bytes(media_id: str) -> bytes:
         r2.raise_for_status()
         return r2.content
 
-
+# ---------- webhook (messages) ----------
 @app.post("/webhook")
 async def whatsapp_inbound(request: Request):
     """
     Receive WhatsApp messages, route to LangGraph, and reply.
     Handles:
-      - Text messages → text reply
-      - Voice notes (audio) → STT → LangGraph → TTS → audio reply (fallback to text)
+      - Text messages → text reply (auto Arabic/English based on message)
+      - Voice notes (audio) → STT → LangGraph → TTS → audio reply (same language as STT)
     """
     try:
         body: Dict[str, Any] = await request.json()
 
-        # WhatsApp sends an array of "entry", each with "changes"
         for entry in body.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {}) or {}
 
-                # 1) Handle inbound messages
                 for msg in value.get("messages", []) or []:
-                    wa_from = msg.get("from")  # sender phone in WA format
+                    wa_from = msg.get("from")
                     if not wa_from:
                         continue
 
@@ -126,15 +174,29 @@ async def whatsapp_inbound(request: Request):
                         if not text:
                             continue
 
-                        # Run one turn
-                        profile = get_profile(wa_from)
-                        reply_text, new_profile = await handle_turn(text, profile)
-                        set_profile(wa_from, new_profile)
+                        # Detect language from incoming text
+                        msg_lang = detect_lang_from_text(text)  # 'ar' or 'en'
+                        if not is_supported_lang(msg_lang):
+                            await send_whatsapp_text(wa_from, UNSUPPORTED_LANG_MSG)
+                            continue
 
-                        # 👇 NEW: normalize dates/prayer names for text too
-                        lang_pref = (new_profile or {}).get("lang") or (profile or {}).get("lang") or "en"
-                        reply_text_norm = normalize_for_tts(reply_text or "", lang_pref)
+                        # Route one turn, hint language to the graph
+                        profile = get_profile(wa_from) or {}
+                        temp_profile = dict(profile)
+                        temp_profile["lang"] = msg_lang
 
+                        reply_text, new_profile = await handle_turn(text, temp_profile)
+                        set_profile(wa_from, new_profile or profile)
+
+                        # ALWAYS translate to Arabic if the user wrote in Arabic
+                        if msg_lang == "ar":
+                            reply_text = await translate_to_ar_gemini(reply_text or "")
+
+                        # Log what we'll send
+                        print(f"[BOT REPLY] lang={msg_lang} → {reply_text}")
+
+                        # Normalize dates/prayer names and send
+                        reply_text_norm = normalize_for_tts(reply_text or "", msg_lang)
                         await send_whatsapp_text(wa_from, reply_text_norm or "…")
                         continue
 
@@ -146,7 +208,7 @@ async def whatsapp_inbound(request: Request):
                             continue
 
                         try:
-                            # 1) Download audio bytes (e.g., OGG/OPUS/AMR/AAC/M4A)
+                            # 1) Download audio bytes
                             media_bytes = await fetch_whatsapp_media_bytes(media_id)
 
                             # 2) STT → text (pass MIME hint so transcode can guess container)
@@ -161,7 +223,9 @@ async def whatsapp_inbound(request: Request):
                             elif "mp3" in mime:
                                 prefer_ext = ".mp3"
 
-                            stt_text, lang = stt_from_opus(media_bytes, prefer_ext=prefer_ext)
+                            stt_text, lang_from_stt = stt_from_opus(
+                                media_bytes, prefer_ext=prefer_ext
+                            )
                             if not stt_text:
                                 await send_whatsapp_text(
                                     wa_from,
@@ -169,16 +233,31 @@ async def whatsapp_inbound(request: Request):
                                 )
                                 continue
 
-                            # 3) Route turn via LangGraph
-                            profile = get_profile(wa_from)
-                            reply_text, new_profile = await handle_turn(stt_text, profile)
-                            set_profile(wa_from, new_profile)
-                            
-                            reply_for_tts = normalize_for_tts(reply_text or "", lang)
+                            # Use STT-detected language for this turn
+                            msg_lang = (lang_from_stt or "en").lower()
+                            if not is_supported_lang(msg_lang):
+                                await send_whatsapp_text(wa_from, UNSUPPORTED_LANG_MSG)
+                                continue
+
+                            # 3) Route turn via LangGraph (hint language)
+                            profile = get_profile(wa_from) or {}
+                            temp_profile = dict(profile)
+                            temp_profile["lang"] = msg_lang
+
+                            reply_text, new_profile = await handle_turn(stt_text, temp_profile)
+                            set_profile(wa_from, new_profile or profile)
+
+                            # ALWAYS translate to Arabic if the user spoke in Arabic
+                            if msg_lang == "ar":
+                                reply_text = await translate_to_ar_gemini(reply_text or "")
+
+                            # Log what we'll speak
+                            print(f"[PIPE] Using TTS lang={msg_lang} | reply={reply_text}")
 
                             # 4) TTS → audio (fallback to text if TTS fails)
+                            reply_for_tts = normalize_for_tts(reply_text or "", msg_lang)
                             try:
-                                mp3 = await tts_elevenlabs(reply_for_tts)
+                                mp3 = await tts_elevenlabs(reply_for_tts, msg_lang)
                                 if mp3:
                                     await send_whatsapp_audio(wa_from, mp3)
                                 else:
@@ -194,12 +273,10 @@ async def whatsapp_inbound(request: Request):
                                 "There was an error processing your voice note. I'll reply in text for now."
                             )
 
-                # 2) Optional: inspect delivery/read statuses
-                # for st in (value.get("statuses") or []):
-                #     pass
+                # Optional: inspect statuses
+                # for st in (value.get("statuses") or []): pass
 
     except Exception as e:
-        # Log but still 200 so Meta doesn't keep retrying
         print("Webhook processing error:", e)
 
     return JSONResponse({"status": "ok"})
