@@ -4,6 +4,8 @@ Simple LangGraph bot for local testing — with onboarding.
 - Routes via LLM classifier (structured JSON): islamic_date | prayer_times | next_prayer | general
 - Validates location against Aladhan
 - Uses Gemini (GEMINI_API_KEY) for classification + general answers
+- Language-aware replies: Arabic if profile["lang"] == "ar", else English
+- Auto-detects Arabic per turn if profile["lang"] not explicitly set
 - No Flask/FastAPI — runs in terminal
 """
 
@@ -12,7 +14,7 @@ import asyncio
 import json
 import re
 from datetime import datetime, timedelta
-from typing import Dict, Literal, TypedDict, Optional, Any, Tuple
+from typing import Dict, Literal, TypedDict, Optional, Any
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -44,7 +46,7 @@ PRAYER_ORDER  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 class BotState(TypedDict, total=False):
     question: str
     intent: Literal["islamic_date", "prayer_times", "next_prayer", "general"]
-    profile: Dict[str, str]   # name, email, city, country, _await?, _setup_done?, _onboarding_ack?, _requested_prayer?, _requested_date?
+    profile: Dict[str, str]   # name, email, city, country, _await?, _setup_done?, _onboarding_ack?, _requested_prayer?, _requested_date?, lang?
     reply: str
 
 # -------------------------
@@ -76,7 +78,6 @@ async def aladhan_fetch(city: Optional[str], country: Optional[str], date: Optio
         r.raise_for_status()
         return r.json()["data"]
 
-
 async def aladhan(city: str, country: str, date: Optional[str] = None) -> Dict[str, Any]:
     url = "https://api.aladhan.com/v1/timingsByCity"
     params = {"city": city, "country": country, "method": 2}
@@ -96,7 +97,6 @@ def normalize_country_name(name: str) -> Optional[str]:
     if not name:
         return None
     n = name.strip()
-    # quick alias expansions
     aliases = {
         "KSA": "Saudi Arabia", "UAE": "United Arab Emirates",
         "UK": "United Kingdom", "USA": "United States",
@@ -106,15 +106,12 @@ def normalize_country_name(name: str) -> Optional[str]:
     }
     if n in aliases:
         return aliases[n]
-    # try exact name match
     try:
         for c in pycountry.countries:
             if n.lower() == c.name.lower():
                 return c.name
-            # also check common/official names if present
             if hasattr(c, "common_name") and n.lower() == c.common_name.lower():
                 return c.common_name
-        # fuzzy: startswith
         for c in pycountry.countries:
             if c.name.lower().startswith(n.lower()):
                 return c.name
@@ -129,16 +126,12 @@ def parse_city_country(line: str) -> tuple[Optional[str], Optional[str]]:
     left, right = line.split("-", 1)
     city_raw = left.strip()
     country_raw = right.strip()
-
-    # basic syntactic sanity
     if len(city_raw) < 2 or len(country_raw) < 2:
         return None, None
-
-    # normalize
     city = city_raw.title()
     country_norm = normalize_country_name(country_raw)
     if not country_norm:
-        return city, None  # city might be fine but country unknown
+        return city, None
     return city, country_norm
 
 def find_country_in_text(text: str) -> Optional[str]:
@@ -146,19 +139,14 @@ def find_country_in_text(text: str) -> Optional[str]:
     if not text:
         return None
     t = text.lower()
-
     alias_map = {
-        "ksa": "Saudi Arabia",
-        "uae": "United Arab Emirates",
-        "uk": "United Kingdom",
-        "usa": "United States",
-        "us": "United States",
-        "pk": "Pakistan",
+        "ksa": "Saudi Arabia", "uae": "United Arab Emirates",
+        "uk": "United Kingdom", "usa": "United States",
+        "us": "United States", "pk": "Pakistan",
     }
     for alias, fullname in alias_map.items():
         if re.search(rf"\b{re.escape(alias)}\b", t):
             return fullname
-
     try:
         for c in pycountry.countries:
             name = c.name.lower()
@@ -171,12 +159,11 @@ def find_country_in_text(text: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
 def get_effective_location(state: BotState) -> tuple[Optional[str], Optional[str], bool]:
     """
     Returns (city, country, address_mode).
-    - address_mode=True => we will query Aladhan by address (city only) and NOT append a country in the reply.
-    - If the user gave an override city but NOT a country, do NOT fall back to the saved country.
-    - Otherwise use (override if present) else (saved profile) for both.
+    - address_mode=True => query Aladhan by address (city only); do NOT append a country in the reply.
     """
     prof = state.get("profile", {}) or {}
     o_city = prof.get("_override_city")
@@ -185,12 +172,11 @@ def get_effective_location(state: BotState) -> tuple[Optional[str], Optional[str
     p_country = prof.get("country")
 
     if o_city and not o_country:
-        return o_city, None, True  # address mode (city only)
+        return o_city, None, True
 
     city = o_city or p_city
     country = o_country or p_country
-    return city, country, False  # timingsByCity mode
-
+    return city, country, False
 
 def clear_overrides(state: BotState) -> None:
     prof = state.get("profile", {}) or {}
@@ -198,11 +184,8 @@ def clear_overrides(state: BotState) -> None:
     prof.pop("_override_country", None)
     state["profile"] = prof
 
-
 async def validate_location_against_api(city: str, country: str) -> tuple[bool, Optional[str]]:
-    """
-    Probe Aladhan. Return (ok, timezone). ok only if timings exist AND a timezone is present.
-    """
+    """Probe Aladhan. Return (ok, timezone)."""
     try:
         data = await aladhan(city, country)
         t = (data or {}).get("timings") or {}
@@ -212,7 +195,6 @@ async def validate_location_against_api(city: str, country: str) -> tuple[bool, 
         return ok, tz
     except Exception:
         return False, None
-
 
 def _safe_json_extract(text: str) -> dict:
     """Best-effort extraction of a single JSON object from LLM text."""
@@ -256,14 +238,12 @@ async def llm_intent_json(question: str) -> dict:
         intent = "general"
 
     slots = data.get("slots", {}) or {}
-    # normalize prayer name
     pn = slots.get("prayer_name")
     if pn:
         mapping = {"fajr":"Fajr","zuhr":"Dhuhr","dhuhr":"Dhuhr","asr":"Asr","maghrib":"Maghrib","isha":"Isha"}
         slots["prayer_name"] = mapping.get(str(pn).strip().lower(), None)
         if slots["prayer_name"] not in PRAYER_NAMES:
             slots["prayer_name"] = None
-    # normalize city/country casing only
     for k in ("city","country"):
         if isinstance(slots.get(k), str):
             val = slots[k].strip()
@@ -300,8 +280,6 @@ async def ensure_profile(state: BotState) -> BotState:
             profile.pop("_staged_loc", None)
             profile.pop("_confirm_loc", None)
             profile.pop("_await", None)
-
-            # mark done immediately
             profile["_setup_done"] = True
             state["reply"] = (
                 f"Shukriya, {profile.get('name', '')}! Setup complete for "
@@ -360,7 +338,6 @@ async def ensure_profile(state: BotState) -> BotState:
             state["profile"] = profile
             return state
 
-        # Stage and ask confirmation — clear _await first
         profile["_staged_loc"] = {"city": city, "country": country, "tz": tz}
         profile["_confirm_loc"] = True
         profile.pop("_await", None)
@@ -390,7 +367,7 @@ async def ensure_profile(state: BotState) -> BotState:
         state["profile"] = profile
         return state
 
-    # --- Final confirmation message once all info present ---
+    # --- Final confirmation once all info present ---
     if not profile.get("_setup_done"):
         profile["_setup_done"] = True
         state["reply"] = (
@@ -402,15 +379,63 @@ async def ensure_profile(state: BotState) -> BotState:
     state["profile"] = profile
     return state
 
+# -------------------------
+# Language helpers
+# -------------------------
+AR_RE = re.compile(r"[\u0600-\u06FF]")
+
+def _lang(state: BotState) -> str:
+    prof = state.get("profile", {}) or {}
+    return (prof.get("lang") or "en").lower()
+
+def _has_ar(text: str) -> bool:
+    return bool(text and AR_RE.search(text))
+
+async def _ensure_output_language(state: BotState, text: str) -> str:
+    """
+    If profile.lang == 'ar', translate final surface text to Arabic (MSA) using Gemini.
+    Otherwise return as-is.
+    """
+    lang = _lang(state)
+    if lang != "ar":
+        return text or ""
+
+    if not text:
+        return ""
+
+    if _has_ar(text):
+        return text
+
+    prompt = (
+        "Translate the following into clear Modern Standard Arabic. "
+        "Keep numbers and proper nouns as-is. No commentary, no transliteration, no diacritics.\n\n"
+        f"{text}"
+    )
+    try:
+        res = await llm.ainvoke(prompt)
+        out = (res.content or "").strip()
+        return out or text
+    except Exception:
+        return text
+
+# <<< NEW >>> Auto-detect language per turn if not supplied
+def _auto_set_lang(profile: Dict[str, str], question: str) -> Dict[str, str]:
+    """
+    Returns a shallow copy of profile with 'lang' set from the question if not explicitly set for this turn.
+    Arabic letters ⇒ 'ar', else 'en'.
+    """
+    prof = dict(profile or {})
+    # Always refresh to the question's language so it adapts turn-by-turn.
+    prof["lang"] = "ar" if _has_ar(question) else "en"
+    return prof
 
 # -------------------------
 # Intent classification (LLM router)
 # -------------------------
 async def classify(state: BotState) -> BotState:
     prof = state.get("profile", {}) or {}
-    # Safety: if onboarding isn't complete (or ack just printed), don't route
     if prof.get("_await") or not _profile_complete(prof) or prof.get("_onboarding_ack") or prof.get("_confirm_loc"):
-        state["intent"] = "general"  # will be short-circuited by route_after_profile -> noop
+        state["intent"] = "general"
         return state
 
     q = state.get("question", "") or ""
@@ -418,22 +443,17 @@ async def classify(state: BotState) -> BotState:
     label = data["intent"]
     slots = data.get("slots", {}) or {}
 
-    # One-turn overrides (do NOT change saved profile)
-    # City: allow ad-hoc override
     if slots.get("city"):
         prof["_override_city"] = slots["city"]
     else:
         prof.pop("_override_city", None)
 
-    # Country: ONLY if explicitly typed in this question
     explicit_country = find_country_in_text(q)
     if explicit_country:
         prof["_override_country"] = normalize_country_name(explicit_country) or explicit_country
     else:
-        # ignore any LLM country slot unless explicit in text
         prof.pop("_override_country", None)
 
-    # Optional slots
     if slots.get("prayer_name"):
         prof["_requested_prayer"] = slots["prayer_name"]
     else:
@@ -467,7 +487,7 @@ def mermaid_diagram() -> str:
     """
 
 # -------------------------
-# Task nodes
+# Task nodes (language-aware)
 # -------------------------
 async def islamic_date(state: BotState) -> BotState:
     city, country, address_mode = get_effective_location(state)
@@ -476,7 +496,8 @@ async def islamic_date(state: BotState) -> BotState:
     greg  = d["date"]["readable"]
 
     place = city if (address_mode or not country) else f"{city}, {country}"
-    state["reply"] = f"Islamic (Hijri) date in {place}: {hijri}\nGregorian: {greg}"
+    base = f"Islamic (Hijri) date in {place}: {hijri}\nGregorian: {greg}"
+    state["reply"] = await _ensure_output_language(state, base)
 
     clear_overrides(state)
     return state
@@ -484,7 +505,6 @@ async def islamic_date(state: BotState) -> BotState:
 async def prayer_times(state: BotState) -> BotState:
     city, country, address_mode = get_effective_location(state)
 
-    # Date selection
     date_req = state["profile"].get("_requested_date")
     date_param: Optional[str] = None
     if date_req:
@@ -510,13 +530,15 @@ async def prayer_times(state: BotState) -> BotState:
     place = city if (address_mode or not country) else f"{city}, {country}"
 
     if req in PRAYER_NAMES:
-        state["reply"] = f"{req} time in {place}: {t.get(req, 'N/A')}"
+        base = f"{req} time in {place}: {t.get(req, 'N/A')}"
+        state["reply"] = await _ensure_output_language(state, base)
         clear_overrides(state)
         return state
 
     lines = [f"{k}: {t.get(k, 'N/A')}" for k in PRAYER_ORDER]
     when = "today" if not date_param else (state["profile"].get("_requested_date") or "the selected date")
-    state["reply"] = f"Prayer times {when} for {place}:\n" + "\n".join(lines)
+    base = f"Prayer times {when} for {place}:\n" + "\n".join(lines)
+    state["reply"] = await _ensure_output_language(state, base)
 
     clear_overrides(state)
     return state
@@ -541,7 +563,6 @@ async def next_prayer(state: BotState) -> BotState:
             break
 
     if not nxt_name:
-        # after Isha → tomorrow's Fajr
         tomorrow = (now + timedelta(days=1)).strftime("%d-%m-%Y")
         d2 = await aladhan_fetch(city, country, tomorrow)
         fajr = clean_time(d2["timings"]["Fajr"])
@@ -550,44 +571,48 @@ async def next_prayer(state: BotState) -> BotState:
         nxt_time = datetime(now.year, now.month, now.day, h, m, tzinfo=tz) + timedelta(days=1)
 
     rem = nxt_time - now
-    hours, rem_mins = divmod(int(rem.total_seconds()) // 60, 60)
+    minutes_total = int(rem.total_seconds() // 60)
+    hours, rem_mins = divmod(minutes_total, 60)
 
     place = city if (address_mode or not country) else f"{city}, {country}"
-    state["reply"] = f"Next prayer in {place}: {nxt_name} at {nxt_time.strftime('%H:%M')} ({hours}h {rem_mins}m left)"
+    base = f"Next prayer in {place}: {nxt_name} at {nxt_time.strftime('%H:%M')} ({hours}h {rem_mins}m left)"
+    state["reply"] = await _ensure_output_language(state, base)
 
     clear_overrides(state)
     return state
 
 async def general(state: BotState) -> BotState:
     q = state.get("question", "")
+    lang = _lang(state)
+
+    if lang == "ar":
+        system = (
+            "أجب باللغة العربية الفصحى فقط. لا تستخدم الإنجليزية. "
+            "قدّم إجابات موجزة ودقيقة، وحافظ على مصطلحات الصلاة والتاريخ الهجري كما هي."
+        )
+    else:
+        system = (
+            "Answer only in English. "
+            "Be concise and accurate; keep Islamic terms (e.g., prayer names, Hijri) consistent."
+        )
+
+    prompt = f"{system}\n\nUser: {q}"
     try:
-        res = await llm.ainvoke(q)
-        state["reply"] = res.content if hasattr(res, "content") else str(res)
+        res = await llm.ainvoke(prompt)
+        text = res.content if hasattr(res, "content") else str(res)
+        state["reply"] = text.strip()
     except Exception as e:
         state["reply"] = f"Error generating response: {e}"
     return state
 
 async def noop(state: BotState) -> BotState:
-    """
-    Sink node used while onboarding is in progress.
-    Ends the current turn. It should NOT clear confirmation flags,
-    otherwise the staged location is lost before the user can say Yes/No.
-    """
+    """Sink node used while onboarding is in progress."""
     prof = state.get("profile", {}) or {}
-
-    # Clear only the one-turn 'thank you' flag so the next turn can route normally.
     if prof.get("_onboarding_ack"):
         prof.pop("_onboarding_ack", None)
-
-    # DO NOT clear _confirm_loc or _staged_loc here.
-    # If we cleared them, the confirmation step would be broken.
-
-    # Defensive: if profile is already complete but _await is somehow set, drop it.
     if _profile_complete(prof) and prof.get("_await"):
         prof.pop("_await", None)
-
     state["profile"] = prof
-    # No reply on purpose.
     return state
 
 # -------------------------
@@ -606,12 +631,9 @@ workflow.set_entry_point("ensure_profile")
 
 def route_after_profile(state: BotState):
     prof = state.get("profile", {}) or {}
-    # Only block routing if we're still collecting a field or confirming location
     if prof.get("_await") or not _profile_complete(prof) or prof.get("_confirm_loc"):
-        return "noop"     # end this turn; don't run classify/LLM yet
+        return "noop"
     return "classify"
-
-
 
 workflow.add_conditional_edges("ensure_profile", route_after_profile, {
     "noop": "noop",
@@ -643,22 +665,25 @@ async def main():
         q = input("You: ")
         if q.lower() in {"quit", "exit"}:
             break
+        # <<< NEW >>> auto-set language each turn for CLI
+        profile = _auto_set_lang(profile, q)
         out = await app_graph.ainvoke({"question": q, "profile": profile})
-        profile = out.get("profile", profile)  # persist across turns
+        profile = out.get("profile", profile)
         print("Bot:", out.get("reply", ""))
-        # Debug (optional):
-        # print("[debug] intent:", out.get("intent"), "| profile:", profile)
+
 # --- Convenience entrypoint for webhooks ---
 async def handle_turn(question: str, profile: Dict[str, str]) -> tuple[str, Dict[str, str]]:
     """
     Runs one turn through the graph and returns (reply_text, new_profile).
-    Safe to call from FastAPI/Flask handlers.
+    Server may pass profile['lang'] = 'ar' or 'en'; if not, it will be auto-detected from `question`.
     """
-    result = await app_graph.ainvoke({"question": question, "profile": profile or {}})
+    # <<< NEW >>> auto-set language each turn for server usage too
+    profile = _auto_set_lang(profile or {}, question or "")
+    result = await app_graph.ainvoke({"question": question, "profile": profile})
     reply = (result.get("reply") or "").strip()
     new_profile = result.get("profile", profile or {})
     return reply, new_profile
 
 if __name__ == "__main__":
-    print(mermaid_diagram())     # copy into mermaid.live to visualize the flow
+    print(mermaid_diagram())
     asyncio.run(main())
