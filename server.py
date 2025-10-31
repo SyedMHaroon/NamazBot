@@ -1,8 +1,7 @@
 # server.py
 import os
 import re
-from typing import Any, Dict, Deque
-from collections import deque
+from typing import Any, Dict, List, Tuple, Optional
 
 import httpx
 from fastapi import FastAPI, Request
@@ -11,24 +10,37 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Voice + WhatsApp clients
+# ---- Voice + WhatsApp helpers (your modules) ----
 from voice_pipeline import stt_from_opus, tts_elevenlabs
 from wa_client import send_whatsapp_text, send_whatsapp_audio
-from session_store import get_profile, set_profile
 from formatting import normalize_for_tts
 
-# LangGraph turn handler (main.py now handles final language of text)
+# ---- Bot turn handler (returns final-language text) ----
 from main import handle_turn
+
+# ---- Data layer: profiles + history (Postgres+Redis) ----
+from session_store import (
+    init_data_layer,
+    get_profile,
+    set_profile,
+    add_turn,
+    fetch_context,
+)
+
+# ---- Data layer: Redis idempotency ----
+from data.redis_store import already_seen as redis_already_seen
+
+# ---- Data layer: Qdrant memory ----
+from data.qdrant_store import search_similar, add_message, ensure_collection, close_http as qdrant_close
 
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "")
 WHATSAPP_TOKEN   = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID", "")
-
 WABASE = "https://graph.facebook.com/v20.0"
 
 app = FastAPI()
 
-# ---------- language helpers ----------
+# ========== language helpers ==========
 ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 
 def detect_lang_from_text(s: str) -> str:
@@ -47,7 +59,24 @@ UNSUPPORTED_LANG_MSG = (
     "من فضلك اكتب رسالتك باللغة الإنجليزية أو العربية."
 )
 
-# ---------- health & verification ----------
+# ========== app lifecycle ==========
+@app.on_event("startup")
+async def _startup():
+    # Ensure Postgres tables exist, and Qdrant collection exists.
+    await init_data_layer()
+    try:
+        await ensure_collection()
+    except Exception as e:
+        print("[WARN] ensure_collection failed (Qdrant):", e)
+
+@app.on_event("shutdown")
+async def _shutdown():
+    try:
+        await qdrant_close()
+    except Exception:
+        pass
+
+# ========== health & verification ==========
 @app.get("/")
 async def health():
     return {"status": "ok"}
@@ -63,7 +92,7 @@ async def whatsapp_verify(request: Request):
         return PlainTextResponse(params["hub.challenge"])
     return PlainTextResponse("Verification failed", status_code=403)
 
-# ---------- helpers ----------
+# ========== helpers ==========
 def extract_text(msg: Dict[str, Any]) -> str:
     mtype = msg.get("type")
     if mtype == "text":
@@ -92,29 +121,49 @@ async def fetch_whatsapp_media_bytes(media_id: str) -> bytes:
         r2.raise_for_status()
         return r2.content
 
-# ---------- de-dup (avoid processing the same message multiple times) ----------
-_RECENT_MSG_IDS: Deque[str] = deque(maxlen=200)
-_RECENT_MSG_SET = set()
+async def build_context(wa_from: str, user_text: str) -> Dict[str, Any]:
+    """
+    Compose the context dict for `handle_turn`:
+      - short_history: last ~10 messages (role, text) from Postgres
+      - semantic_snippets: top-k related lines from Qdrant
+    """
+    short_history: List[Tuple[str, str]] = await fetch_context(wa_from, limit=10)
 
-def already_seen(msg_id: str) -> bool:
-    if not msg_id:
-        return False
-    if msg_id in _RECENT_MSG_SET:
-        return True
-    _RECENT_MSG_SET.add(msg_id)
-    _RECENT_MSG_IDS.append(msg_id)
-    # prune if needed
-    while len(_RECENT_MSG_SET) > _RECENT_MSG_IDS.maxlen:
-        oldest = _RECENT_MSG_IDS.popleft()
-        _RECENT_MSG_SET.discard(oldest)
-    return False
+    semantic_snippets: List[str] = []
+    try:
+        hits = await search_similar(user_id=wa_from, query_text=user_text, top_k=5, score_threshold=0.35)
+        semantic_snippets = [h.get("text", "") for h in hits if h.get("text")]
+    except Exception as e:
+        # Don’t fail the turn if Qdrant is down
+        print("[WARN] Qdrant search_similar failed:", e)
 
-# ---------- webhook (messages) ----------
+    return {
+        "short_history": short_history,         # [(role, text), ...] chronological
+        "semantic_snippets": semantic_snippets  # [str, ...]
+    }
+
+async def persist_turn_everywhere(wa_from: str, user_text: str, bot_text: str, lang: str):
+    """
+    - Append (user, assistant) to Postgres
+    - Add both messages to Qdrant for future recall
+    """
+    # Postgres
+    await add_turn(wa_from, user_text, bot_text, lang=lang)
+
+    # Qdrant (best-effort; don’t raise)
+    try:
+        await add_message(user_id=wa_from, text=user_text, role="user")
+        if bot_text:
+            await add_message(user_id=wa_from, text=bot_text, role="assistant")
+    except Exception as e:
+        print("[WARN] Qdrant add_message failed:", e)
+
+# ========== webhook (messages) ==========
 @app.post("/webhook")
 async def whatsapp_inbound(request: Request):
     """
-    - Text  → detect 'ar'/'en' → handle_turn (main.py returns final language text) → send text
-    - Audio → STT(lang) → handle_turn(lang hint) → TTS with same lang (no extra translate here)
+    - Text  → detect 'ar'/'en' → build context → handle_turn → send text → persist to DB/Qdrant
+    - Audio → STT(lang) → build context → handle_turn → TTS/audio → persist to DB/Qdrant
     """
     try:
         body: Dict[str, Any] = await request.json()
@@ -128,8 +177,14 @@ async def whatsapp_inbound(request: Request):
                     msg_id  = msg.get("id")
                     if not wa_from:
                         continue
-                    if already_seen(msg_id):
-                        continue
+
+                    # Global idempotency with Redis
+                    try:
+                        if await redis_already_seen(wa_from, msg_id or ""):
+                            continue
+                    except Exception as e:
+                        # If Redis is briefly unavailable, proceed anyway
+                        print("[WARN] redis_already_seen failed:", e)
 
                     mtype = msg.get("type")
 
@@ -144,18 +199,24 @@ async def whatsapp_inbound(request: Request):
                             await send_whatsapp_text(wa_from, UNSUPPORTED_LANG_MSG)
                             continue
 
-                        profile = get_profile(wa_from) or {}
+                        # Load + set profile language hint (final surface language handled in main.py)
+                        profile = await get_profile(wa_from) or {}
                         temp_profile = dict(profile)
                         temp_profile["lang"] = msg_lang
 
-                        reply_text, new_profile = await handle_turn(text, temp_profile)
-                        set_profile(wa_from, new_profile or profile)
+                        # Build per-turn context (history + semantic recall)
+                        ctx = await build_context(wa_from, text)
 
-                        # No translation here — main.py returns the final language already.
-                        print(f"[BOT REPLY] lang={msg_lang} → {reply_text}")
+                        # Bot turn
+                        reply_text, new_profile = await handle_turn(text, temp_profile, context=ctx)
+                        await set_profile(wa_from, new_profile or profile)
 
+                        # Normalize & send
                         reply_text_norm = normalize_for_tts(reply_text or "", msg_lang)
                         await send_whatsapp_text(wa_from, reply_text_norm or "…")
+
+                        # Persist to DB + Qdrant
+                        await persist_turn_everywhere(wa_from, text, reply_text_norm, lang=msg_lang)
                         continue
 
                     # ---- VOICE NOTE / AUDIO ----
@@ -185,26 +246,31 @@ async def whatsapp_inbound(request: Request):
                                 await send_whatsapp_text(wa_from, UNSUPPORTED_LANG_MSG)
                                 continue
 
-                            profile = get_profile(wa_from) or {}
+                            profile = await get_profile(wa_from) or {}
                             temp_profile = dict(profile)
                             temp_profile["lang"] = msg_lang
 
-                            reply_text, new_profile = await handle_turn(stt_text, temp_profile)
-                            set_profile(wa_from, new_profile or profile)
+                            # Context
+                            ctx = await build_context(wa_from, stt_text)
 
-                            # No translation here — main.py returns the final language already.
-                            print(f"[PIPE] Using TTS lang={msg_lang} | reply={reply_text}")
+                            # Bot turn
+                            reply_text, new_profile = await handle_turn(stt_text, temp_profile, context=ctx)
+                            await set_profile(wa_from, new_profile or profile)
 
+                            # TTS or text fallback
                             reply_for_tts = normalize_for_tts(reply_text or "", msg_lang)
                             try:
                                 mp3 = await tts_elevenlabs(reply_for_tts, msg_lang)
                                 if mp3:
                                     await send_whatsapp_audio(wa_from, mp3)
                                 else:
-                                    await send_whatsapp_text(wa_from, reply_text or "…")
+                                    await send_whatsapp_text(wa_from, reply_for_tts or "…")
                             except Exception as tts_err:
                                 print("TTS error:", tts_err)
-                                await send_whatsapp_text(wa_from, reply_text or "…")
+                                await send_whatsapp_text(wa_from, reply_for_tts or "…")
+
+                            # Persist
+                            await persist_turn_everywhere(wa_from, stt_text, reply_for_tts, lang=msg_lang)
 
                         except Exception as e:
                             print("Voice handling error:", e)

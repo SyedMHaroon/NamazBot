@@ -1,12 +1,12 @@
 """
-Simple LangGraph bot for local testing — with onboarding.
+Simple LangGraph bot — onboarding + context-aware (no server/web code here).
 - Collects: Name, Email, Location ("City - Country")
-- Routes via LLM classifier (structured JSON): islamic_date | prayer_times | next_prayer | general
-- Validates location against Aladhan
+- Routes via LLM classifier (JSON): islamic_date | prayer_times | next_prayer | general
+- Validates location against Aladhan (shared HTTP client + small cache)
 - Uses Gemini (GEMINI_API_KEY) for classification + general answers
 - Language-aware replies: Arabic if profile["lang"] == "ar", else English
 - Auto-detects Arabic per turn if profile["lang"] not explicitly set
-- No Flask/FastAPI — runs in terminal
+- Accepts optional `context` from server: short_history + semantic_snippets
 """
 
 import os
@@ -14,14 +14,14 @@ import asyncio
 import json
 import re
 from datetime import datetime, timedelta
-from typing import Dict, Literal, TypedDict, Optional, Any
+from typing import Dict, Literal, TypedDict, Optional, Any, List, Tuple
 from zoneinfo import ZoneInfo
+from time import time
 
 import httpx
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
-
 import pycountry
 
 load_dotenv()
@@ -36,6 +36,28 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.3,
 )
 
+# -------------------------
+# Shared HTTP client + tiny cache for Aladhan
+# -------------------------
+HTTP = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(15.0, connect=5.0))
+
+# cache key: (city or "", country or "", date or "")
+_ALADHAN_CACHE: dict[tuple[str, str, str], tuple[float, dict]] = {}
+_ALADHAN_TTL = int(os.getenv("ALADHAN_TTL_SECONDS", "600"))  # 10 min default
+
+def _cache_get(key: tuple[str, str, str]) -> Optional[dict]:
+    item = _ALADHAN_CACHE.get(key)
+    if not item:
+        return None
+    ts, data = item
+    if time() - ts > _ALADHAN_TTL:
+        _ALADHAN_CACHE.pop(key, None)
+        return None
+    return data
+
+def _cache_set(key: tuple[str, str, str], data: dict) -> None:
+    _ALADHAN_CACHE[key] = (time(), data)
+
 INTENT_LABELS = ["islamic_date", "prayer_times", "next_prayer", "general"]
 PRAYER_NAMES  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 PRAYER_ORDER  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
@@ -46,7 +68,8 @@ PRAYER_ORDER  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 class BotState(TypedDict, total=False):
     question: str
     intent: Literal["islamic_date", "prayer_times", "next_prayer", "general"]
-    profile: Dict[str, str]   # name, email, city, country, _await?, _setup_done?, _onboarding_ack?, _requested_prayer?, _requested_date?, lang?
+    profile: Dict[str, str]     # name, email, city, country, tz, lang, plus temp flags
+    context: Dict[str, Any]     # {"short_history": [(role,text),...], "semantic_snippets": [str,...]}
     reply: str
 
 # -------------------------
@@ -58,6 +81,7 @@ async def aladhan_fetch(city: Optional[str], country: Optional[str], date: Optio
     """
     If both city and country are present -> use timingsByCity.
     If only city is present -> use timingsByAddress (no guessing a country).
+    Cached for a short TTL to reduce latency/cost.
     """
     if not city:
         raise ValueError("aladhan_fetch requires at least a city.")
@@ -66,27 +90,39 @@ async def aladhan_fetch(city: Optional[str], country: Optional[str], date: Optio
     if date:
         base_params["date"] = date
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
-        if city and country:
-            url = "https://api.aladhan.com/v1/timingsByCity"
-            params = {**base_params, "city": city, "country": country}
-        else:
-            url = "https://api.aladhan.com/v1/timingsByAddress"
-            params = {**base_params, "address": city}
+    key = (city or "", country or "", date or "")
+    cached = _cache_get(key)
+    if cached:
+        return cached
 
-        r = await c.get(url, params=params)
-        r.raise_for_status()
-        return r.json()["data"]
+    if city and country:
+        url = "https://api.aladhan.com/v1/timingsByCity"
+        params = {**base_params, "city": city, "country": country}
+    else:
+        url = "https://api.aladhan.com/v1/timingsByAddress"
+        params = {**base_params, "address": city}
+
+    r = await HTTP.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()["data"]
+    _cache_set(key, data)
+    return data
 
 async def aladhan(city: str, country: str, date: Optional[str] = None) -> Dict[str, Any]:
+    key = (city or "", country or "", date or "")
+    cached = _cache_get(key)
+    if cached:
+        return cached
+
     url = "https://api.aladhan.com/v1/timingsByCity"
     params = {"city": city, "country": country, "method": 2}
     if date:
         params["date"] = date
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
-        r = await c.get(url, params=params)
-        r.raise_for_status()
-        return r.json()["data"]
+    r = await HTTP.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()["data"]
+    _cache_set(key, data)
+    return data
 
 def clean_time(t: str) -> str:
     m = re.search(r"(\d{1,2}:\d{2})", t)
@@ -209,11 +245,70 @@ def _safe_json_extract(text: str) -> dict:
                 return {}
         return {}
 
-async def llm_intent_json(question: str) -> dict:
+# -------------------------
+# Language helpers
+# -------------------------
+AR_RE = re.compile(r"[\u0600-\u06FF]")
+
+def _lang(state: BotState) -> str:
+    prof = state.get("profile", {}) or {}
+    return (prof.get("lang") or "en").lower()
+
+def _has_ar(text: str) -> bool:
+    return bool(text and AR_RE.search(text))
+
+async def _ensure_output_language(state: BotState, text: str) -> str:
+    """
+    If profile.lang == 'ar', translate final surface text to Arabic (MSA) using Gemini.
+    Otherwise return as-is.
+    """
+    lang = _lang(state)
+    if lang != "ar":
+        return text or ""
+
+    if not text:
+        return ""
+
+    if _has_ar(text):
+        return text
+
+    prompt = (
+        "Translate the following into clear Modern Standard Arabic. "
+        "Keep numbers and proper nouns as-is. No commentary, no transliteration, no diacritics.\n\n"
+        f"{text}"
+    )
+    try:
+        res = await llm.ainvoke(prompt)
+        out = (res.content or "").strip()
+        return out or text
+    except Exception:
+        return text
+
+# Auto-detect language per turn (from user input)
+def _auto_set_lang(profile: Dict[str, str], question: str) -> Dict[str, str]:
+    prof = dict(profile or {})
+    prof["lang"] = "ar" if _has_ar(question) else "en"
+    return prof
+
+# -------------------------
+# Intent classification (LLM router)
+# -------------------------
+async def llm_intent_json(question: str, context: Optional[Dict[str, Any]] = None) -> dict:
     """
     Ask Gemini for strict JSON: {"intent": "...", "slots": {"prayer_name":..., "date":..., "city":..., "country":...}}
     IMPORTANT: The model must NOT infer country; only set it if the user explicitly typed it.
+    We allow the last few user turns as faint signal but keep router simple.
     """
+    # Light-touch use of history: include last 2 user messages (if provided)
+    history_lines: List[str] = []
+    if context:
+        sh = context.get("short_history") or []
+        # sh is expected as [(role,text), ...]
+        for role, txt in sh[-4:]:  # last 4 entries max to keep router cheap
+            if role == "user" and txt:
+                history_lines.append(f"- {txt}")
+    history_block = "\n".join(history_lines)
+
     system = (
         "You are a router that ONLY returns strict JSON. No prose, no markdown.\n"
         "Allowed intents: islamic_date, prayer_times, next_prayer, general.\n"
@@ -225,11 +320,11 @@ async def llm_intent_json(question: str) -> dict:
         "If unsure about ANY slot, set it to null. DO NOT invent or infer countries.\n"
         "Respond with exactly this JSON schema:\n"
         "{\n"
-        "  \"intent\": \"islamic_date|prayer_times|next_prayer|general\",\n"
-        "  \"slots\": {\"prayer_name\": null|string, \"date\": null|string, \"city\": null|string, \"country\": null|string}\n"
+        '  "intent": "islamic_date|prayer_times|next_prayer|general",\n'
+        '  "slots": {"prayer_name": null|string, "date": null|string, "city": null|string, "country": null|string}\n'
         "}\n"
     )
-    prompt = f"{system}\nUser: {question}\n"
+    prompt = f"{system}\nRecent user messages:\n{history_block}\n\nCurrent user: {question}\n"
     res = await llm.ainvoke(prompt)
     data = _safe_json_extract((res.content or "").strip())
 
@@ -277,6 +372,9 @@ async def ensure_profile(state: BotState) -> BotState:
             staged = profile.get("_staged_loc", {})
             profile["city"] = staged.get("city")
             profile["country"] = staged.get("country")
+            if staged.get("tz"):
+                profile["tz"] = staged.get("tz")
+
             profile.pop("_staged_loc", None)
             profile.pop("_confirm_loc", None)
             profile.pop("_await", None)
@@ -380,57 +478,7 @@ async def ensure_profile(state: BotState) -> BotState:
     return state
 
 # -------------------------
-# Language helpers
-# -------------------------
-AR_RE = re.compile(r"[\u0600-\u06FF]")
-
-def _lang(state: BotState) -> str:
-    prof = state.get("profile", {}) or {}
-    return (prof.get("lang") or "en").lower()
-
-def _has_ar(text: str) -> bool:
-    return bool(text and AR_RE.search(text))
-
-async def _ensure_output_language(state: BotState, text: str) -> str:
-    """
-    If profile.lang == 'ar', translate final surface text to Arabic (MSA) using Gemini.
-    Otherwise return as-is.
-    """
-    lang = _lang(state)
-    if lang != "ar":
-        return text or ""
-
-    if not text:
-        return ""
-
-    if _has_ar(text):
-        return text
-
-    prompt = (
-        "Translate the following into clear Modern Standard Arabic. "
-        "Keep numbers and proper nouns as-is. No commentary, no transliteration, no diacritics.\n\n"
-        f"{text}"
-    )
-    try:
-        res = await llm.ainvoke(prompt)
-        out = (res.content or "").strip()
-        return out or text
-    except Exception:
-        return text
-
-# <<< NEW >>> Auto-detect language per turn if not supplied
-def _auto_set_lang(profile: Dict[str, str], question: str) -> Dict[str, str]:
-    """
-    Returns a shallow copy of profile with 'lang' set from the question if not explicitly set for this turn.
-    Arabic letters ⇒ 'ar', else 'en'.
-    """
-    prof = dict(profile or {})
-    # Always refresh to the question's language so it adapts turn-by-turn.
-    prof["lang"] = "ar" if _has_ar(question) else "en"
-    return prof
-
-# -------------------------
-# Intent classification (LLM router)
+# Router
 # -------------------------
 async def classify(state: BotState) -> BotState:
     prof = state.get("profile", {}) or {}
@@ -439,7 +487,7 @@ async def classify(state: BotState) -> BotState:
         return state
 
     q = state.get("question", "") or ""
-    data = await llm_intent_json(q)
+    data = await llm_intent_json(q, context=state.get("context"))
     label = data["intent"]
     slots = data.get("slots", {}) or {}
 
@@ -547,7 +595,7 @@ async def next_prayer(state: BotState) -> BotState:
     city, country, address_mode = get_effective_location(state)
 
     d = await aladhan_fetch(city, country, None)
-    tzname = d.get("meta", {}).get("timezone", "UTC")
+    tzname = (state.get("profile", {}) or {}).get("tz") or d.get("meta", {}).get("timezone", "UTC")
     tz     = ZoneInfo(tzname)
     now    = datetime.now(tz)
     t = {k: clean_time(v) for k, v in d["timings"].items()}
@@ -563,6 +611,7 @@ async def next_prayer(state: BotState) -> BotState:
             break
 
     if not nxt_name:
+        # after Isha → tomorrow's Fajr
         tomorrow = (now + timedelta(days=1)).strftime("%d-%m-%Y")
         d2 = await aladhan_fetch(city, country, tomorrow)
         fajr = clean_time(d2["timings"]["Fajr"])
@@ -582,25 +631,59 @@ async def next_prayer(state: BotState) -> BotState:
     return state
 
 async def general(state: BotState) -> BotState:
+    """
+    General chat uses context:
+      - short_history (last few turns) to keep continuity
+      - semantic_snippets (Qdrant recalls) to ground answers
+    """
     q = state.get("question", "")
     lang = _lang(state)
+    context = state.get("context") or {}
+    short_history = context.get("short_history") or []  # [(role, text), ...]
+    semantic_snippets = context.get("semantic_snippets") or []
+
+    # Build a compact conversation preface (keep tiny for latency)
+    hist_lines: List[str] = []
+    for role, msg in short_history[-10:]:
+        if not msg:
+            continue
+        if role == "user":
+            hist_lines.append(f"User: {msg}")
+        elif role == "assistant":
+            hist_lines.append(f"Assistant: {msg}")
+    history_block = "\n".join(hist_lines)
+
+    snippet_block = ""
+    if semantic_snippets:
+        snippet_block = "Relevant notes:\n" + "\n".join(f"- {s}" for s in semantic_snippets[:5])
 
     if lang == "ar":
         system = (
-            "أجب باللغة العربية الفصحى فقط. لا تستخدم الإنجليزية. "
-            "قدّم إجابات موجزة ودقيقة، وحافظ على مصطلحات الصلاة والتاريخ الهجري كما هي."
+            "أجب باللغة العربية الفصحى فقط. لا تستخدم الإنجليزية.\n"
+            "كن موجزًا ودقيقًا؛ استخدم المصطلحات الإسلامية كما هي (مثل أسماء الصلوات والتاريخ الهجري).\n"
+            "إذا وُجدت ملاحظات مرجعية، اعتمد عليها بدون ذكر المصدر حرفيًا."
         )
     else:
         system = (
-            "Answer only in English. "
-            "Be concise and accurate; keep Islamic terms (e.g., prayer names, Hijri) consistent."
+            "Answer only in English. Be concise and accurate.\n"
+            "Use Islamic terms consistently (e.g., prayer names, Hijri) and prefer clarity over verbosity.\n"
+            "If reference notes are provided, use them to keep continuity without quoting sources verbatim."
         )
 
-    prompt = f"{system}\n\nUser: {q}"
+    prompt = f"""{system}
+
+Conversation so far:
+{history_block}
+
+{snippet_block}
+
+Current user: {q}
+"""
+
     try:
         res = await llm.ainvoke(prompt)
         text = res.content if hasattr(res, "content") else str(res)
-        state["reply"] = text.strip()
+        state["reply"] = (text or "").strip()
     except Exception as e:
         state["reply"] = f"Error generating response: {e}"
     return state
@@ -656,30 +739,47 @@ for node in ["islamic_date","prayer_times","next_prayer","general","noop"]:
 app_graph = workflow.compile()
 
 # -------------------------
-# Runner for local testing (stateful profile across turns)
+# Runner for local testing
 # -------------------------
 async def main():
     profile: Dict[str, str] = {}
+    context: Dict[str, Any] = {"short_history": [], "semantic_snippets": []}
     print("Assalamualaikum! I'll collect a few details to personalize timings.")
-    while True:
-        q = input("You: ")
-        if q.lower() in {"quit", "exit"}:
-            break
-        # <<< NEW >>> auto-set language each turn for CLI
-        profile = _auto_set_lang(profile, q)
-        out = await app_graph.ainvoke({"question": q, "profile": profile})
-        profile = out.get("profile", profile)
-        print("Bot:", out.get("reply", ""))
+    try:
+        while True:
+            q = input("You: ")
+            if q.lower() in {"quit", "exit"}:
+                break
+            # auto-set language each turn for CLI
+            profile = _auto_set_lang(profile, q)
+            # keep a tiny local history for demo CLI
+            context["short_history"].append(("user", q))
+            out = await app_graph.ainvoke({"question": q, "profile": profile, "context": context})
+            profile = out.get("profile", profile)
+            reply = out.get("reply", "")
+            context["short_history"].append(("assistant", reply))
+            print("Bot:", reply)
+    finally:
+        try:
+            await HTTP.aclose()
+        except Exception:
+            pass
 
-# --- Convenience entrypoint for webhooks ---
-async def handle_turn(question: str, profile: Dict[str, str]) -> tuple[str, Dict[str, str]]:
+# --- Entry for server usage ---
+async def handle_turn(
+    question: str,
+    profile: Dict[str, str],
+    context: Optional[Dict[str, Any]] = None
+) -> tuple[str, Dict[str, str]]:
     """
     Runs one turn through the graph and returns (reply_text, new_profile).
-    Server may pass profile['lang'] = 'ar' or 'en'; if not, it will be auto-detected from `question`.
+    Server may pass profile['lang'] = 'ar' or 'en'; if not, auto-detected from `question`.
+    `context` may contain:
+      - short_history: list[(role, text)]   # chronological
+      - semantic_snippets: list[str]
     """
-    # <<< NEW >>> auto-set language each turn for server usage too
     profile = _auto_set_lang(profile or {}, question or "")
-    result = await app_graph.ainvoke({"question": question, "profile": profile})
+    result = await app_graph.ainvoke({"question": question, "profile": profile, "context": context or {}})
     reply = (result.get("reply") or "").strip()
     new_profile = result.get("profile", profile or {})
     return reply, new_profile
