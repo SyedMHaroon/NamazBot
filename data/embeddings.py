@@ -26,16 +26,27 @@ if not HF_API_TOKEN:
 HF_API_BASE = os.getenv("HF_API_BASE", "https://api-inference.huggingface.co")
 
 # Choose the model to use
-EMBED_MODEL = os.getenv("EMBEDDINGS_MODEL", "BAAI/bge-base-en-v1.5")
+# Using intfloat/e5-small-v2 as default (reliable and widely available via HF Inference API)
+# Works with Hugging Face Inference API - no local libraries needed
+# Alternatives: sentence-transformers/all-MiniLM-L6-v2 (384d), BAAI/bge-small-en-v1.5 (384d)
+EMBED_MODEL = os.getenv("EMBEDDINGS_MODEL", "intfloat/e5-small-v2")
 
-# Known dims (we default to 768 for the selected model)
+# Known dims
 _DEFAULT_DIMS = {
     "BAAI/bge-base-en-v1.5": 768,
+    "BAAI/bge-small-en-v1.5": 384,
+    "BAAI/bge-large-en-v1.5": 1024,
+    "intfloat/e5-small-v2": 384,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
+    "all-MiniLM-L6-v2": 384,
 }
 
 EMBED_DIM = int(
-    os.getenv("EMBEDDINGS_DIM") or str(_DEFAULT_DIMS.get(EMBED_MODEL, 768))
+    os.getenv("EMBEDDINGS_DIM") or str(_DEFAULT_DIMS.get(EMBED_MODEL, 384))
 )
+
+# Debug: Print the model being used (at module load time)
+print(f"[EMBED] Configured embedding model: {EMBED_MODEL} (dim={EMBED_DIM})")
 
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "25"))
 EMBED_MAX_BATCH = int(os.getenv("EMBED_MAX_BATCH", "64"))
@@ -88,6 +99,7 @@ class EmbeddingsClient:
         self.max_batch = max_batch
         self.normalize = normalize
         self.url = _embedding_url(model)
+        print(f"[EMBED] EmbeddingsClient initialized with model: {self.model}, url: {self.url}")
 
     def embed(self, texts: List[str], retry: int = 2) -> List[List[float]]:
         """Create embeddings for a list of texts."""
@@ -106,6 +118,9 @@ class EmbeddingsClient:
 
         for _ in range(retry + 1):
             try:
+                # Debug: log which URL we're calling
+                if _ == 0:  # Only log on first attempt
+                    print(f"[EMBED] Calling HF API: {self.url} with model: {self.model}")
                 r = _client.post(self.url, json=payload)
 
                 # Handle transient issues like rate limiting or model loading
@@ -146,12 +161,23 @@ class EmbeddingsClient:
         raise RuntimeError(f"HF embedding failed after retries: {last_err}")
 
 # -------------------- Convenience API --------------------
-emb = EmbeddingsClient()
+# Create client lazily to pick up environment variable changes
+_emb_client: Optional[EmbeddingsClient] = None
+
+def _get_emb_client() -> EmbeddingsClient:
+    """Get or create the embeddings client (recreates if model changes)."""
+    global _emb_client
+    # Use the module-level EMBED_MODEL which is already resolved from env or default
+    current_model = EMBED_MODEL
+    if _emb_client is None or _emb_client.model != current_model:
+        print(f"[EMBED] Creating/recreating client with model: {current_model} (old: {_emb_client.model if _emb_client else 'None'})")
+        _emb_client = EmbeddingsClient(model=current_model)
+    return _emb_client
 
 def embed_query(text: str) -> List[float]:
     """Convenient wrapper to embed a single query."""
-    return emb.embed([text])[0]
+    return _get_emb_client().embed([text])[0]
 
 def embed_many(texts: List[str]) -> List[List[float]]:
     """Convenient wrapper to embed multiple queries."""
-    return emb.embed(texts)
+    return _get_emb_client().embed(texts)

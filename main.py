@@ -13,7 +13,7 @@ import os
 import asyncio
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Literal, TypedDict, Optional, Any, List, Tuple
 from zoneinfo import ZoneInfo
 from time import time
@@ -22,6 +22,9 @@ import httpx
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 import pycountry
 
 load_dotenv()
@@ -58,7 +61,7 @@ def _cache_get(key: tuple[str, str, str]) -> Optional[dict]:
 def _cache_set(key: tuple[str, str, str], data: dict) -> None:
     _ALADHAN_CACHE[key] = (time(), data)
 
-INTENT_LABELS = ["islamic_date", "prayer_times", "next_prayer", "general"]
+INTENT_LABELS = ["islamic_date", "prayer_times", "next_prayer", "reminder", "general"]
 PRAYER_NAMES  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 PRAYER_ORDER  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 
@@ -67,7 +70,7 @@ PRAYER_ORDER  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 # -------------------------
 class BotState(TypedDict, total=False):
     question: str
-    intent: Literal["islamic_date", "prayer_times", "next_prayer", "general"]
+    intent: Literal["islamic_date", "prayer_times", "next_prayer", "reminder", "general"]
     profile: Dict[str, str]     # name, email, city, country, tz, lang, plus temp flags
     context: Dict[str, Any]     # {"short_history": [(role,text),...], "semantic_snippets": [str,...]}
     reply: str
@@ -246,6 +249,77 @@ def _safe_json_extract(text: str) -> dict:
         return {}
 
 # -------------------------
+# APScheduler setup
+# -------------------------
+_scheduler: Optional[AsyncIOScheduler] = None
+
+def get_scheduler() -> AsyncIOScheduler:
+    """Get or create the global scheduler instance."""
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = AsyncIOScheduler()
+    return _scheduler
+
+async def start_scheduler():
+    """Start the scheduler if not already running."""
+    scheduler = get_scheduler()
+    if not scheduler.running:
+        scheduler.start()
+        print("[SCHED] APScheduler started")
+
+async def stop_scheduler():
+    """Stop the scheduler gracefully."""
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown()
+        _scheduler = None
+        print("[SCHED] APScheduler stopped")
+
+def setup_digest_scheduler(get_profile_fn, send_text_fn, hour: int = 17, minute: int = 35, dedupe: bool = False):
+    """
+    Schedule daily digest at hour:minute (default 16:09) in each user's timezone.
+    This runs digest_job.run_digest_tick for all subscribed users.
+    
+    Args:
+        dedupe: If True, skip if already sent today. If False, always send (for testing).
+    """
+    from digest_job import run_digest_tick
+    scheduler = get_scheduler()
+    
+    # Schedule to run every minute - run_digest_tick will check if it's the right time for each user
+    scheduler.add_job(
+        run_digest_tick,
+        trigger=CronTrigger(minute="*"),  # Every minute
+        args=[get_profile_fn, send_text_fn, hour, minute, dedupe],
+        id="daily_digest",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,  # Execute if missed within 60 seconds
+        coalesce=True  # Combine multiple missed runs into one
+    )
+    print(f"[SCHED] Digest scheduled to run at {hour:02d}:{minute:02d} in each user's timezone (dedupe={dedupe})")
+
+def setup_reminder_scheduler(send_text_fn):
+    """
+    Schedule reminder tick to run every minute.
+    This processes reminders from Redis.
+    """
+    from digest_job import run_reminder_tick
+    scheduler = get_scheduler()
+    
+    scheduler.add_job(
+        run_reminder_tick,
+        trigger=CronTrigger(minute="*"),  # Every minute
+        args=[send_text_fn],
+        id="reminder_tick",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,  # Execute if missed within 60 seconds
+        coalesce=True  # Combine multiple missed runs into one
+    )
+    print("[SCHED] Reminder tick scheduled to run every minute")
+
+# -------------------------
 # Language helpers
 # -------------------------
 AR_RE = re.compile(r"[\u0600-\u06FF]")
@@ -311,17 +385,20 @@ async def llm_intent_json(question: str, context: Optional[Dict[str, Any]] = Non
 
     system = (
         "You are a router that ONLY returns strict JSON. No prose, no markdown.\n"
-        "Allowed intents: islamic_date, prayer_times, next_prayer, general.\n"
+        "Allowed intents: islamic_date, prayer_times, next_prayer, reminder, general.\n"
         "Slots (all optional):\n"
         "  - prayer_name: Fajr|Dhuhr|Asr|Maghrib|Isha\n"
         "  - date: today|tomorrow|YYYY-MM-DD\n"
         "  - city: string (ONLY if user typed a city)\n"
         "  - country: string (ONLY if user explicitly typed a country; DO NOT GUESS OR INFER)\n"
+        "  - reminder_text: string (ONLY for reminder intent; the text to remind about)\n"
+        "  - reminder_time: string (ONLY for reminder intent; time like 'HH:MM' or relative like 'in 30 minutes')\n"
+        "Use 'reminder' intent when user asks to set a reminder, alarm, or scheduled notification.\n"
         "If unsure about ANY slot, set it to null. DO NOT invent or infer countries.\n"
         "Respond with exactly this JSON schema:\n"
         "{\n"
-        '  "intent": "islamic_date|prayer_times|next_prayer|general",\n'
-        '  "slots": {"prayer_name": null|string, "date": null|string, "city": null|string, "country": null|string}\n'
+        '  "intent": "islamic_date|prayer_times|next_prayer|reminder|general",\n'
+        '  "slots": {"prayer_name": null|string, "date": null|string, "city": null|string, "country": null|string, "reminder_text": null|string, "reminder_time": null|string}\n'
         "}\n"
     )
     prompt = f"{system}\nRecent user messages:\n{history_block}\n\nCurrent user: {question}\n"
@@ -379,10 +456,21 @@ async def ensure_profile(state: BotState) -> BotState:
             profile.pop("_confirm_loc", None)
             profile.pop("_await", None)
             profile["_setup_done"] = True
+            
+            # Automatically subscribe user to daily digest
+            wa_id = state.get("wa_id")
+            if wa_id:
+                try:
+                    from digest_job import subscribe_to_digest
+                    await subscribe_to_digest(wa_id)
+                except Exception as e:
+                    print(f"[SCHED] Failed to auto-subscribe {wa_id} to digest: {e}")
+            
             state["reply"] = (
                 f"Shukriya, {profile.get('name', '')}! Setup complete for "
                 f"{profile['city']}, {profile['country']}.\n"
-                "You can now ask: 'Fajr time', 'Next prayer', or 'Islamic date'."
+                "You can now ask: 'Fajr time', 'Next prayer', or 'Islamic date'.\n"
+                "You'll also receive daily prayer time digests."
             )
             state["profile"] = profile
             return state
@@ -468,10 +556,20 @@ async def ensure_profile(state: BotState) -> BotState:
     # --- Final confirmation once all info present ---
     if not profile.get("_setup_done"):
         profile["_setup_done"] = True
+        # Automatically subscribe user to daily digest
+        wa_id = state.get("wa_id")
+        if wa_id:
+            try:
+                from digest_job import subscribe_to_digest
+                await subscribe_to_digest(wa_id)
+            except Exception as e:
+                print(f"[SCHED] Failed to auto-subscribe {wa_id} to digest: {e}")
+        
         state["reply"] = (
             f"Shukriya, {profile['name']}! Setup complete for "
             f"{profile['city']}, {profile['country']}.\n"
-            "You can now ask: 'Fajr time', 'Next prayer', or 'Islamic date'."
+            "You can now ask: 'Fajr time', 'Next prayer', or 'Islamic date'.\n"
+            "You'll also receive daily prayer time digests."
         )
 
     state["profile"] = profile
@@ -512,6 +610,16 @@ async def classify(state: BotState) -> BotState:
     else:
         prof.pop("_requested_date", None)
 
+    if slots.get("reminder_text"):
+        prof["_reminder_text"] = slots["reminder_text"]
+    else:
+        prof.pop("_reminder_text", None)
+
+    if slots.get("reminder_time"):
+        prof["_reminder_time"] = slots["reminder_time"]
+    else:
+        prof.pop("_reminder_time", None)
+
     state["profile"] = prof
     state["intent"] = label
     return state
@@ -527,10 +635,12 @@ def mermaid_diagram() -> str:
     classify -->|islamic_date| islamic_date
     classify -->|prayer_times| prayer_times
     classify -->|next_prayer| next_prayer
+    classify -->|reminder| scheduler_agent
     classify -->|general| general
     islamic_date --> END((END))
     prayer_times --> END
     next_prayer --> END
+    scheduler_agent --> END
     general --> END
     """
 
@@ -630,6 +740,150 @@ async def next_prayer(state: BotState) -> BotState:
     clear_overrides(state)
     return state
 
+async def scheduler_agent(state: BotState) -> BotState:
+    """
+    Handle reminder creation requests.
+    Parses reminder_text and reminder_time from profile, enqueues reminder to Redis.
+    """
+    from digest_job import enqueue_reminder
+    
+    q = state.get("question", "")
+    prof = state.get("profile", {}) or {}
+    lang = _lang(state)
+    
+    # Get reminder slots from profile (set by classify node)
+    reminder_text = prof.get("_reminder_text") or ""
+    reminder_time_str = prof.get("_reminder_time") or ""
+    
+    # If not extracted from slots, try to parse from question using LLM
+    if not reminder_text or not reminder_time_str:
+        # Use LLM to extract reminder details
+        prompt = (
+            f"Extract reminder details from: {q}\n"
+            "Return JSON: {\"text\": \"reminder text\", \"time\": \"HH:MM\" or \"in X minutes\" or \"in X hours\"}\n"
+            "If time is relative (e.g., 'in 30 minutes'), parse it. If absolute (e.g., '14:30'), use it.\n"
+            "If unclear, return {\"text\": null, \"time\": null}"
+        )
+        try:
+            res = await llm.ainvoke(prompt)
+            data = _safe_json_extract((res.content or "").strip())
+            reminder_text = reminder_text or data.get("text", "")
+            reminder_time_str = reminder_time_str or data.get("time", "")
+        except Exception as e:
+            print(f"[SCHED] LLM reminder extraction failed: {e}")
+    
+    # Validate reminder data
+    if not reminder_text:
+        if lang == "ar":
+            base = "لم أتمكن من فهم نص التذكير. من فضلك حدد ما تريد أن يتم تذكيرك به ومتى."
+        else:
+            base = "I couldn't understand the reminder text. Please specify what you want to be reminded about and when."
+        state["reply"] = base
+        prof.pop("_reminder_text", None)
+        prof.pop("_reminder_time", None)
+        state["profile"] = prof
+        return state
+    
+    if not reminder_time_str:
+        if lang == "ar":
+            base = "لم أتمكن من فهم وقت التذكير. من فضلك حدد الوقت (مثل: '14:30' أو 'بعد 30 دقيقة')."
+        else:
+            base = "I couldn't understand the reminder time. Please specify the time (e.g., '14:30' or 'in 30 minutes')."
+        state["reply"] = base
+        prof.pop("_reminder_text", None)
+        prof.pop("_reminder_time", None)
+        state["profile"] = prof
+        return state
+    
+    # Get user timezone
+    tzname = prof.get("tz") or "UTC"
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    
+    now_local = datetime.now(tz)
+    
+    # Parse reminder time
+    due_time: Optional[datetime] = None
+    
+    # Check if relative time (e.g., "in 30 minutes", "in 2 hours")
+    relative_match = re.search(r"in\s+(\d+)\s*(minute|hour|min|hr|h)", reminder_time_str.lower())
+    if relative_match:
+        value = int(relative_match.group(1))
+        unit = relative_match.group(2).lower()
+        if unit in ("minute", "min"):
+            due_time = now_local + timedelta(minutes=value)
+        elif unit in ("hour", "hr", "h"):
+            due_time = now_local + timedelta(hours=value)
+    else:
+        # Try to parse absolute time (HH:MM)
+        time_match = re.search(r"(\d{1,2}):(\d{2})", reminder_time_str)
+        if time_match:
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2))
+            due_time = datetime(now_local.year, now_local.month, now_local.day, hour, minute, tzinfo=tz)
+            # If time has passed today, schedule for tomorrow
+            if due_time <= now_local:
+                due_time += timedelta(days=1)
+    
+    if not due_time:
+        if lang == "ar":
+            base = "لم أتمكن من فهم وقت التذكير. استخدم التنسيق: 'HH:MM' (مثل: '14:30') أو 'بعد X دقيقة/ساعة'."
+        else:
+            base = "I couldn't parse the reminder time. Use format: 'HH:MM' (e.g., '14:30') or 'in X minutes/hours'."
+        state["reply"] = base
+        prof.pop("_reminder_text", None)
+        prof.pop("_reminder_time", None)
+        state["profile"] = prof
+        return state
+    
+    # Convert to UTC for Redis storage
+    due_utc = due_time.astimezone(timezone.utc)
+    due_utc_epoch = due_utc.timestamp()
+    
+    # Get user WhatsApp ID from context or profile
+    # We'll need to pass this through state - for now, use a placeholder
+    # The server will need to inject wa_id into state
+    wa_id = state.get("wa_id", "")
+    
+    if not wa_id:
+        # Fallback: try to get from profile (server should set this)
+        wa_id = prof.get("_wa_id", "")
+    
+    if wa_id:
+        try:
+            await enqueue_reminder(wa_id, reminder_text, due_utc_epoch)
+            
+            # Format confirmation message
+            time_str = due_time.strftime("%H:%M")
+            if lang == "ar":
+                base = f"تم تحديد التذكير: '{reminder_text}' في الساعة {time_str}"
+            else:
+                base = f"Reminder set: '{reminder_text}' at {time_str}"
+            
+            state["reply"] = base
+        except Exception as e:
+            print(f"[SCHED] Failed to enqueue reminder: {e}")
+            if lang == "ar":
+                base = "حدث خطأ في تحديد التذكير. يرجى المحاولة مرة أخرى."
+            else:
+                base = "Failed to set reminder. Please try again."
+            state["reply"] = base
+    else:
+        # If no wa_id, inform user (shouldn't happen in production)
+        if lang == "ar":
+            base = "لا يمكن تحديد التذكير بدون معرف المستخدم."
+        else:
+            base = "Cannot set reminder without user ID."
+        state["reply"] = base
+    
+    # Clean up temporary slots
+    prof.pop("_reminder_text", None)
+    prof.pop("_reminder_time", None)
+    state["profile"] = prof
+    return state
+
 async def general(state: BotState) -> BotState:
     """
     General chat uses context:
@@ -707,6 +961,7 @@ workflow.add_node("classify", classify)
 workflow.add_node("islamic_date", islamic_date)
 workflow.add_node("prayer_times", prayer_times)
 workflow.add_node("next_prayer", next_prayer)
+workflow.add_node("scheduler_agent", scheduler_agent)
 workflow.add_node("general", general)
 workflow.add_node("noop", noop)
 
@@ -730,10 +985,11 @@ workflow.add_conditional_edges("classify", route, {
     "islamic_date": "islamic_date",
     "prayer_times": "prayer_times",
     "next_prayer": "next_prayer",
+    "reminder": "scheduler_agent",
     "general": "general",
 })
 
-for node in ["islamic_date","prayer_times","next_prayer","general","noop"]:
+for node in ["islamic_date","prayer_times","next_prayer","scheduler_agent","general","noop"]:
     workflow.add_edge(node, END)
 
 app_graph = workflow.compile()
@@ -769,7 +1025,8 @@ async def main():
 async def handle_turn(
     question: str,
     profile: Dict[str, str],
-    context: Optional[Dict[str, Any]] = None
+    context: Optional[Dict[str, Any]] = None,
+    wa_id: Optional[str] = None
 ) -> tuple[str, Dict[str, str]]:
     """
     Runs one turn through the graph and returns (reply_text, new_profile).
@@ -777,9 +1034,13 @@ async def handle_turn(
     `context` may contain:
       - short_history: list[(role, text)]   # chronological
       - semantic_snippets: list[str]
+    `wa_id` is the WhatsApp user ID, needed for reminder scheduling.
     """
     profile = _auto_set_lang(profile or {}, question or "")
-    result = await app_graph.ainvoke({"question": question, "profile": profile, "context": context or {}})
+    state_dict = {"question": question, "profile": profile, "context": context or {}}
+    if wa_id:
+        state_dict["wa_id"] = wa_id
+    result = await app_graph.ainvoke(state_dict)
     reply = (result.get("reply") or "").strip()
     new_profile = result.get("profile", profile or {})
     return reply, new_profile

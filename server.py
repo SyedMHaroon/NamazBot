@@ -16,7 +16,7 @@ from wa_client import send_whatsapp_text, send_whatsapp_audio
 from formatting import normalize_for_tts
 
 # ---- Bot turn handler (returns final-language text) ----
-from main import handle_turn
+from main import handle_turn, start_scheduler, stop_scheduler, setup_digest_scheduler, setup_reminder_scheduler
 
 # ---- Data layer: profiles + history (Postgres+Redis) ----
 from session_store import (
@@ -31,7 +31,8 @@ from session_store import (
 from data.redis_store import already_seen as redis_already_seen
 
 # ---- Data layer: Qdrant memory ----
-from data.qdrant_store import search_similar, add_message, ensure_collection, close_http as qdrant_close
+# TODO: Uncomment when embeddings API is working
+# from data.qdrant_store import search_similar, add_message, ensure_collection, close_http as qdrant_close
 
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "")
 WHATSAPP_TOKEN   = os.getenv("WHATSAPP_TOKEN", "")
@@ -64,17 +65,33 @@ UNSUPPORTED_LANG_MSG = (
 async def _startup():
     # Ensure Postgres tables exist, and Qdrant collection exists.
     await init_data_layer()
-    try:
-        await ensure_collection()
-    except Exception as e:
-        print("[WARN] ensure_collection failed (Qdrant):", e)
+    # TODO: Uncomment when embeddings API is working
+    # try:
+    #     await ensure_collection()
+    # except Exception as e:
+    #     print("[WARN] ensure_collection failed (Qdrant):", e)
+    
+    # Initialize and start APScheduler
+    await start_scheduler()
+    
+    # Setup digest scheduler
+    # Set dedupe=False for testing (always sends), dedupe=True for production (once per day)
+    setup_digest_scheduler(get_profile, send_whatsapp_text, hour=17, minute=35, dedupe=False)
+    
+    # Setup reminder tick scheduler (runs every minute)
+    setup_reminder_scheduler(send_whatsapp_text)
 
 @app.on_event("shutdown")
 async def _shutdown():
     try:
-        await qdrant_close()
+        await stop_scheduler()
     except Exception:
         pass
+    # TODO: Uncomment when embeddings API is working
+    # try:
+    #     await qdrant_close()
+    # except Exception:
+    #     pass
 
 # ========== health & verification ==========
 @app.get("/")
@@ -130,12 +147,13 @@ async def build_context(wa_from: str, user_text: str) -> Dict[str, Any]:
     short_history: List[Tuple[str, str]] = await fetch_context(wa_from, limit=10)
 
     semantic_snippets: List[str] = []
-    try:
-        hits = await search_similar(user_id=wa_from, query_text=user_text, top_k=5, score_threshold=0.35)
-        semantic_snippets = [h.get("text", "") for h in hits if h.get("text")]
-    except Exception as e:
-        # Don’t fail the turn if Qdrant is down
-        print("[WARN] Qdrant search_similar failed:", e)
+    # TODO: Uncomment when embeddings API is working
+    # try:
+    #     hits = await search_similar(user_id=wa_from, query_text=user_text, top_k=5, score_threshold=0.35)
+    #     semantic_snippets = [h.get("text", "") for h in hits if h.get("text")]
+    # except Exception as e:
+    #     # Don't fail the turn if Qdrant is down
+    #     print("[WARN] Qdrant search_similar failed:", e)
 
     return {
         "short_history": short_history,         # [(role, text), ...] chronological
@@ -150,13 +168,14 @@ async def persist_turn_everywhere(wa_from: str, user_text: str, bot_text: str, l
     # Postgres
     await add_turn(wa_from, user_text, bot_text, lang=lang)
 
-    # Qdrant (best-effort; don’t raise)
-    try:
-        await add_message(user_id=wa_from, text=user_text, role="user")
-        if bot_text:
-            await add_message(user_id=wa_from, text=bot_text, role="assistant")
-    except Exception as e:
-        print("[WARN] Qdrant add_message failed:", e)
+    # TODO: Uncomment when embeddings API is working
+    # Qdrant (best-effort; don't raise)
+    # try:
+    #     await add_message(user_id=wa_from, text=user_text, role="user")
+    #     if bot_text:
+    #         await add_message(user_id=wa_from, text=bot_text, role="assistant")
+    # except Exception as e:
+    #     print("[WARN] Qdrant add_message failed:", e)
 
 # ========== webhook (messages) ==========
 @app.post("/webhook")
@@ -208,7 +227,7 @@ async def whatsapp_inbound(request: Request):
                         ctx = await build_context(wa_from, text)
 
                         # Bot turn
-                        reply_text, new_profile = await handle_turn(text, temp_profile, context=ctx)
+                        reply_text, new_profile = await handle_turn(text, temp_profile, context=ctx, wa_id=wa_from)
                         await set_profile(wa_from, new_profile or profile)
 
                         # Normalize & send
@@ -254,7 +273,7 @@ async def whatsapp_inbound(request: Request):
                             ctx = await build_context(wa_from, stt_text)
 
                             # Bot turn
-                            reply_text, new_profile = await handle_turn(stt_text, temp_profile, context=ctx)
+                            reply_text, new_profile = await handle_turn(stt_text, temp_profile, context=ctx, wa_id=wa_from)
                             await set_profile(wa_from, new_profile or profile)
 
                             # TTS or text fallback
