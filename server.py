@@ -16,7 +16,7 @@ from wa_client import send_whatsapp_text, send_whatsapp_audio
 from formatting import normalize_for_tts
 
 # ---- Bot turn handler (returns final-language text) ----
-from main import handle_turn, start_scheduler, stop_scheduler, setup_digest_scheduler, setup_reminder_scheduler
+from main import handle_turn, start_scheduler, stop_scheduler, setup_digest_scheduler, setup_reminder_scheduler, setup_prayer_reminder_scheduler
 
 # ---- Data layer: profiles + history (Postgres+Redis) ----
 from session_store import (
@@ -30,6 +30,10 @@ from session_store import (
 # ---- Data layer: Redis idempotency ----
 from data.redis_store import already_seen as redis_already_seen
 
+# Digest schedule and deduplication settings
+DIGEST_HOUR = int(os.getenv("DIGEST_HOUR"))
+DIGEST_MINUTE = int(os.getenv("DIGEST_MINUTE"))
+DIGEST_DEDUPE = os.getenv("DIGEST_DEDUPE")
 # ---- Data layer: Qdrant memory ----
 # TODO: Uncomment when embeddings API is working
 # from data.qdrant_store import search_similar, add_message, ensure_collection, close_http as qdrant_close
@@ -76,10 +80,13 @@ async def _startup():
     
     # Setup digest scheduler
     # Set dedupe=False for testing (always sends), dedupe=True for production (once per day)
-    setup_digest_scheduler(get_profile, send_whatsapp_text, hour=17, minute=35, dedupe=False)
+    setup_digest_scheduler(get_profile, send_whatsapp_text, hour=DIGEST_HOUR, minute=DIGEST_MINUTE, dedupe=DIGEST_DEDUPE)
     
     # Setup reminder tick scheduler (runs every minute)
     setup_reminder_scheduler(send_whatsapp_text)
+    
+    # Setup prayer reminder scheduler (runs every minute, sends reminders 10 min before each prayer)
+    setup_prayer_reminder_scheduler(get_profile, send_whatsapp_text)
 
 @app.on_event("shutdown")
 async def _shutdown():

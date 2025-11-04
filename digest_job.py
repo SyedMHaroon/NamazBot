@@ -1,13 +1,19 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 import httpx
-
+import os
 # Redis access (async)
 from data.redis_store import get_redis
 # WhatsApp send
 from wa_client import send_whatsapp_text
+from dotenv import load_dotenv
+load_dotenv()
 
+# Digest schedule and deduplication settings
+DIGEST_HOUR = int(os.getenv("DIGEST_HOUR"))
+DIGEST_MINUTE = int(os.getenv("DIGEST_MINUTE"))
+DIGEST_DEDUPE = os.getenv("DIGEST_DEDUPE")
 
 # ---------------- Region-aware Aladhan helpers ----------------
 def _choose_method(country: str) -> int:
@@ -134,13 +140,15 @@ async def is_subscribed_to_digest(wa_id: str) -> bool:
         return False
 
 # ------------- Scheduled ticks -------------
-async def run_digest_tick(get_profile, send_text=send_whatsapp_text, hour: int = 17, minute: int = 35, dedupe: bool = False):
+async def run_digest_tick(get_profile, send_text=send_whatsapp_text, hour: int = DIGEST_HOUR, minute: int = DIGEST_MINUTE, dedupe: bool = DIGEST_DEDUPE):
     """
     Iterate subscribers in Redis set 'digest:subs'.
     If local time ≈ hour:minute (±1 min) and not sent today, push the digest.
     
     Args:
         dedupe: If True, skip if already sent today. If False, always send (for testing).
+        hour: The hour of the day to send the digest.
+        minute: The minute of the hour to send the digest.
     """
     import zoneinfo
     r = await get_redis()
@@ -231,3 +239,111 @@ async def run_reminder_tick(send_text=send_whatsapp_text, batch_window_seconds: 
             await send_text(data["wa_id"], f"⏰ Reminder: {data['text']}")
         except Exception as e:
             print("[SCHED] reminder delivery failed:", e)
+
+
+# ---- prayer reminders (10 minutes before each prayer) ----
+async def run_prayer_reminder_tick(get_profile, send_text=send_whatsapp_text):
+    """
+    Every minute: Check all users and send prayer reminders 10 minutes before each prayer time.
+    Uses deduplication to ensure each prayer reminder is sent only once per day.
+    """
+    import zoneinfo
+    from main import aladhan_fetch, PRAYER_ORDER, PRAYER_NAMES
+    
+    r = await get_redis()
+    
+    # Get all users (could be from digest subscribers or all profiles)
+    # For now, we'll check digest subscribers as they have complete profiles
+    wa_ids = await r.smembers("digest:subs")
+    if not wa_ids:
+        return
+    
+    for wa_id in wa_ids:
+        try:
+            profile = await get_profile(wa_id) or {}
+            city = (profile.get("city") or "").strip()
+            country = (profile.get("country") or "").strip()
+            tz_name = (profile.get("tz") or "").strip()
+            lang = (profile.get("lang") or "en").lower()
+            
+            if not (city and country and tz_name):
+                continue
+            
+            try:
+                tz = zoneinfo.ZoneInfo(tz_name)
+            except Exception:
+                continue
+            
+            now_local = datetime.now(tz)
+            
+            # Fetch today's prayer times
+            try:
+                d = await aladhan_fetch(city, country, None)
+                timings = d.get("timings", {}) or {}
+            except Exception as e:
+                print(f"[SCHED] Failed to fetch prayer times for {wa_id}: {e}")
+                continue
+            
+            # Check each prayer time
+            for prayer_name in PRAYER_ORDER:
+                if prayer_name not in timings:
+                    continue
+                
+                # Parse prayer time
+                prayer_time_str = timings[prayer_name]
+                try:
+                    # Extract HH:MM from prayer time string
+                    import re
+                    time_match = re.search(r"(\d{1,2}):(\d{2})", prayer_time_str)
+                    if not time_match:
+                        continue
+                    hour = int(time_match.group(1))
+                    minute = int(time_match.group(2))
+                    prayer_dt = datetime(now_local.year, now_local.month, now_local.day, hour, minute, tzinfo=tz)
+                    
+                    # If prayer time has already passed today, skip it
+                    if prayer_dt < now_local:
+                        continue
+                except Exception:
+                    continue
+                
+                # Calculate reminder time (10 minutes before)
+                reminder_dt = prayer_dt - timedelta(minutes=10)
+                
+                # Skip if reminder time has already passed (shouldn't happen if prayer hasn't passed, but safety check)
+                if reminder_dt < now_local:
+                    continue
+                
+                # Check if we're within 1 minute of the reminder time
+                time_diff = abs((now_local - reminder_dt).total_seconds())
+                if time_diff > 60:  # More than 1 minute away
+                    continue
+                
+                # Check deduplication - ensure we haven't sent this reminder today
+                reminder_key = f"prayer_reminder:{wa_id}:{prayer_name}:{now_local.date().isoformat()}"
+                if await r.get(reminder_key):
+                    continue  # Already sent today
+                
+                # Build reminder message
+                prayer_time_display = prayer_dt.strftime("%H:%M")
+                if lang == "ar":
+                    prayer_names_ar = {
+                        "Fajr": "الفجر", "Dhuhr": "الظهر", "Asr": "العصر",
+                        "Maghrib": "المغرب", "Isha": "العشاء"
+                    }
+                    prayer_ar = prayer_names_ar.get(prayer_name, prayer_name)
+                    msg = f"⏰ تذكير: صلاة {prayer_ar} في الساعة {prayer_time_display} (خلال 10 دقائق)"
+                else:
+                    msg = f"⏰ Reminder: {prayer_name} prayer at {prayer_time_display} (in 10 minutes)"
+                
+                # Send reminder
+                try:
+                    await send_text(wa_id, msg)
+                    # Mark as sent (expires after 24 hours)
+                    await r.set(reminder_key, "1", ex=24 * 3600)
+                    print(f"[SCHED] Sent {prayer_name} reminder to {wa_id} at {now_local.strftime('%H:%M')}")
+                except Exception as e:
+                    print(f"[SCHED] Failed to send prayer reminder to {wa_id}: {e}")
+        
+        except Exception as e:
+            print(f"[SCHED] Prayer reminder tick failed for {wa_id}: {e}")

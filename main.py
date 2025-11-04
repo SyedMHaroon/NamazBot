@@ -39,6 +39,10 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.3,
 )
 
+# Digest schedule and deduplication settings
+DIGEST_HOUR = int(os.getenv("DIGEST_HOUR"))
+DIGEST_MINUTE = int(os.getenv("DIGEST_MINUTE"))
+DIGEST_DEDUPE = os.getenv("DIGEST_DEDUPE")
 # -------------------------
 # Shared HTTP client + tiny cache for Aladhan
 # -------------------------
@@ -275,7 +279,7 @@ async def stop_scheduler():
         _scheduler = None
         print("[SCHED] APScheduler stopped")
 
-def setup_digest_scheduler(get_profile_fn, send_text_fn, hour: int = 17, minute: int = 35, dedupe: bool = False):
+def setup_digest_scheduler(get_profile_fn, send_text_fn, hour: int = DIGEST_HOUR, minute: int = DIGEST_MINUTE, dedupe: bool = DIGEST_DEDUPE):
     """
     Schedule daily digest at hour:minute (default 16:09) in each user's timezone.
     This runs digest_job.run_digest_tick for all subscribed users.
@@ -318,6 +322,26 @@ def setup_reminder_scheduler(send_text_fn):
         coalesce=True  # Combine multiple missed runs into one
     )
     print("[SCHED] Reminder tick scheduled to run every minute")
+
+def setup_prayer_reminder_scheduler(get_profile_fn, send_text_fn):
+    """
+    Schedule prayer reminder tick to run every minute.
+    This checks for upcoming prayers and sends reminders 10 minutes before each prayer.
+    """
+    from digest_job import run_prayer_reminder_tick
+    scheduler = get_scheduler()
+    
+    scheduler.add_job(
+        run_prayer_reminder_tick,
+        trigger=CronTrigger(minute="*"),  # Every minute
+        args=[get_profile_fn, send_text_fn],
+        id="prayer_reminder_tick",
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=60,  # Execute if missed within 60 seconds
+        coalesce=True  # Combine multiple missed runs into one
+    )
+    print("[SCHED] Prayer reminder tick scheduled to run every minute (10 minutes before each prayer)")
 
 # -------------------------
 # Language helpers
@@ -386,6 +410,7 @@ async def llm_intent_json(question: str, context: Optional[Dict[str, Any]] = Non
     system = (
         "You are a router that ONLY returns strict JSON. No prose, no markdown.\n"
         "Allowed intents: islamic_date, prayer_times, next_prayer, reminder, general.\n"
+        "IMPORTANT: ANY question about dates, today's date, Hijri date, Islamic date, Gregorian date, or 'what date' should ALWAYS be 'islamic_date'.\n"
         "Slots (all optional):\n"
         "  - prayer_name: Fajr|Dhuhr|Asr|Maghrib|Isha\n"
         "  - date: today|tomorrow|YYYY-MM-DD\n"
@@ -394,6 +419,8 @@ async def llm_intent_json(question: str, context: Optional[Dict[str, Any]] = Non
         "  - reminder_text: string (ONLY for reminder intent; the text to remind about)\n"
         "  - reminder_time: string (ONLY for reminder intent; time like 'HH:MM' or relative like 'in 30 minutes')\n"
         "Use 'reminder' intent when user asks to set a reminder, alarm, or scheduled notification.\n"
+        "Use 'islamic_date' for ANY date-related query (today, what date, Hijri, Gregorian, etc.).\n"
+        "Use 'general' ONLY for questions that don't fit any other category - and note that the bot will politely decline general chat.\n"
         "If unsure about ANY slot, set it to null. DO NOT invent or infer countries.\n"
         "Respond with exactly this JSON schema:\n"
         "{\n"
@@ -585,6 +612,19 @@ async def classify(state: BotState) -> BotState:
         return state
 
     q = state.get("question", "") or ""
+    
+    # Pre-route date queries directly to islamic_date (before LLM classification)
+    q_lower = q.lower()
+    date_keywords = [
+        "date", "today", "what day", "hijri", "islamic date", "gregorian",
+        "التاريخ", "اليوم", "هجري", "ميلادي", "what's the date", "what is the date",
+        "current date", "today date", "today's date"
+    ]
+    if any(keyword in q_lower for keyword in date_keywords):
+        state["intent"] = "islamic_date"
+        state["profile"] = prof
+        return state
+    
     data = await llm_intent_json(q, context=state.get("context"))
     label = data["intent"]
     slots = data.get("slots", {}) or {}
@@ -886,60 +926,32 @@ async def scheduler_agent(state: BotState) -> BotState:
 
 async def general(state: BotState) -> BotState:
     """
-    General chat uses context:
-      - short_history (last few turns) to keep continuity
-      - semantic_snippets (Qdrant recalls) to ground answers
+    Handles general questions by politely redirecting users to specialized features.
+    Prevents hallucinations by not using LLM for general chat.
     """
-    q = state.get("question", "")
     lang = _lang(state)
-    context = state.get("context") or {}
-    short_history = context.get("short_history") or []  # [(role, text), ...]
-    semantic_snippets = context.get("semantic_snippets") or []
-
-    # Build a compact conversation preface (keep tiny for latency)
-    hist_lines: List[str] = []
-    for role, msg in short_history[-10:]:
-        if not msg:
-            continue
-        if role == "user":
-            hist_lines.append(f"User: {msg}")
-        elif role == "assistant":
-            hist_lines.append(f"Assistant: {msg}")
-    history_block = "\n".join(hist_lines)
-
-    snippet_block = ""
-    if semantic_snippets:
-        snippet_block = "Relevant notes:\n" + "\n".join(f"- {s}" for s in semantic_snippets[:5])
-
+    
     if lang == "ar":
-        system = (
-            "أجب باللغة العربية الفصحى فقط. لا تستخدم الإنجليزية.\n"
-            "كن موجزًا ودقيقًا؛ استخدم المصطلحات الإسلامية كما هي (مثل أسماء الصلوات والتاريخ الهجري).\n"
-            "إذا وُجدت ملاحظات مرجعية، اعتمد عليها بدون ذكر المصدر حرفيًا."
+        reply = (
+            "أعتذر، أنا متخصص في:\n"
+            "• أوقات الصلاة (الفجر، الظهر، العصر، المغرب، العشاء)\n"
+            "• التاريخ الهجري والميلادي\n"
+            "• الصلاة القادمة\n"
+            "• التذكيرات والتنبيهات\n\n"
+            "من فضلك اسألني عن إحدى هذه الخدمات."
         )
     else:
-        system = (
-            "Answer only in English. Be concise and accurate.\n"
-            "Use Islamic terms consistently (e.g., prayer names, Hijri) and prefer clarity over verbosity.\n"
-            "If reference notes are provided, use them to keep continuity without quoting sources verbatim."
+        reply = (
+            "I'm a specialized assistant for Islamic prayer services.\n\n"
+            "I can help you with:\n"
+            "• Prayer times (Fajr, Dhuhr, Asr, Maghrib, Isha)\n"
+            "• Islamic (Hijri) and Gregorian dates\n"
+            "• Next prayer time\n"
+            "• Setting reminders\n\n"
+            "Please ask me about one of these services."
         )
-
-    prompt = f"""{system}
-
-Conversation so far:
-{history_block}
-
-{snippet_block}
-
-Current user: {q}
-"""
-
-    try:
-        res = await llm.ainvoke(prompt)
-        text = res.content if hasattr(res, "content") else str(res)
-        state["reply"] = (text or "").strip()
-    except Exception as e:
-        state["reply"] = f"Error generating response: {e}"
+    
+    state["reply"] = reply
     return state
 
 async def noop(state: BotState) -> BotState:
