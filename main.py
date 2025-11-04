@@ -78,6 +78,7 @@ class BotState(TypedDict, total=False):
     profile: Dict[str, str]     # name, email, city, country, tz, lang, plus temp flags
     context: Dict[str, Any]     # {"short_history": [(role,text),...], "semantic_snippets": [str,...]}
     reply: str
+    wa_id: Optional[str]         # WhatsApp user ID, needed for reminders
 
 # -------------------------
 # Helpers: API + parsing
@@ -599,7 +600,11 @@ async def ensure_profile(state: BotState) -> BotState:
             "You'll also receive daily prayer time digests."
         )
 
+    # Preserve wa_id through state updates
+    existing_wa_id = state.get("wa_id")
     state["profile"] = profile
+    if existing_wa_id:
+        state["wa_id"] = existing_wa_id
     return state
 
 # -------------------------
@@ -660,8 +665,12 @@ async def classify(state: BotState) -> BotState:
     else:
         prof.pop("_reminder_time", None)
 
+    # Preserve wa_id through state updates
+    existing_wa_id = state.get("wa_id")
     state["profile"] = prof
     state["intent"] = label
+    if existing_wa_id:
+        state["wa_id"] = existing_wa_id
     return state
 
 # -------------------------
@@ -882,14 +891,14 @@ async def scheduler_agent(state: BotState) -> BotState:
     due_utc = due_time.astimezone(timezone.utc)
     due_utc_epoch = due_utc.timestamp()
     
-    # Get user WhatsApp ID from context or profile
-    # We'll need to pass this through state - for now, use a placeholder
-    # The server will need to inject wa_id into state
-    wa_id = state.get("wa_id", "")
+    # Get user WhatsApp ID from state (should be set by handle_turn)
+    wa_id = state.get("wa_id") or ""
     
+    # Debug logging to help diagnose issues
     if not wa_id:
-        # Fallback: try to get from profile (server should set this)
-        wa_id = prof.get("_wa_id", "")
+        print(f"[SCHED] Warning: wa_id not found in state. State keys: {list(state.keys())}")
+        # Fallback: try to get from profile (shouldn't be needed, but just in case)
+        wa_id = prof.get("_wa_id", "") or ""
     
     if wa_id:
         try:
@@ -1052,6 +1061,9 @@ async def handle_turn(
     state_dict = {"question": question, "profile": profile, "context": context or {}}
     if wa_id:
         state_dict["wa_id"] = wa_id
+        # wa_id set successfully
+    else:
+        print(f"[WARN] handle_turn called without wa_id - reminders will not work")
     result = await app_graph.ainvoke(state_dict)
     reply = (result.get("reply") or "").strip()
     new_profile = result.get("profile", profile or {})
