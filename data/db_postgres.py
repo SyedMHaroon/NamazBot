@@ -37,6 +37,7 @@ class User(Base):
     country = Column(String(120))
     tz = Column(String(120))          # e.g., "Asia/Karachi"
     lang = Column(String(5))          # 'en' | 'ar'
+    zapier_mcp_url = Column(Text, nullable=True)  # Zapier MCP server URL for Google Calendar
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -83,7 +84,7 @@ async def get_user(wa_id: str) -> Optional[Dict[str, Any]]:
         q = await session.execute(
             text(
                 """
-                SELECT id, wa_id, name, email, city, country, tz, lang, created_at, updated_at
+                SELECT id, wa_id, name, email, city, country, tz, lang, zapier_mcp_url, created_at, updated_at
                 FROM users WHERE wa_id = :wa_id
                 """
             ),
@@ -213,6 +214,26 @@ async def trim_messages_to(wa_id: str, keep: int = 10) -> int:
         )
         await session.commit()
         return deleted.rowcount if (deleted.rowcount or 0) > 0 else 0
+
+
+# ---------- Zapier MCP URL management ----------
+async def get_zapier_mcp_url(wa_id: str) -> Optional[str]:
+    """Get Zapier MCP URL for a user."""
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(User.zapier_mcp_url).where(User.wa_id == wa_id)
+        )
+        return res.scalar_one_or_none()
+
+
+async def set_zapier_mcp_url(wa_id: str, mcp_url: str) -> None:
+    """Set Zapier MCP URL for a user."""
+    async with SessionLocal() as session:
+        await session.execute(
+            text("UPDATE users SET zapier_mcp_url = :url, updated_at = NOW() WHERE wa_id = :wa_id"),
+            {"url": mcp_url, "wa_id": wa_id}
+        )
+        await session.commit()
 
 
 # ---------- Back-compat aliases (so older imports keep working) ----------

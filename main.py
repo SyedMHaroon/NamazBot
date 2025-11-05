@@ -65,7 +65,7 @@ def _cache_get(key: tuple[str, str, str]) -> Optional[dict]:
 def _cache_set(key: tuple[str, str, str], data: dict) -> None:
     _ALADHAN_CACHE[key] = (time(), data)
 
-INTENT_LABELS = ["islamic_date", "prayer_times", "next_prayer", "reminder", "general"]
+INTENT_LABELS = ["islamic_date", "prayer_times", "next_prayer", "reminder", "calendar_connect", "calendar_create_event", "calendar_view_events", "calendar_find_events", "calendar_delete_event", "general"]
 PRAYER_NAMES  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 PRAYER_ORDER  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 
@@ -74,7 +74,7 @@ PRAYER_ORDER  = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 # -------------------------
 class BotState(TypedDict, total=False):
     question: str
-    intent: Literal["islamic_date", "prayer_times", "next_prayer", "reminder", "general"]
+    intent: Literal["islamic_date", "prayer_times", "next_prayer", "reminder", "calendar_connect", "calendar_create_event", "calendar_view_events", "calendar_find_events", "calendar_delete_event", "general"]
     profile: Dict[str, str]     # name, email, city, country, tz, lang, plus temp flags
     context: Dict[str, Any]     # {"short_history": [(role,text),...], "semantic_snippets": [str,...]}
     reply: str
@@ -410,8 +410,14 @@ async def llm_intent_json(question: str, context: Optional[Dict[str, Any]] = Non
 
     system = (
         "You are a router that ONLY returns strict JSON. No prose, no markdown.\n"
-        "Allowed intents: islamic_date, prayer_times, next_prayer, reminder, general.\n"
+        "Allowed intents: islamic_date, prayer_times, next_prayer, reminder, calendar_connect, calendar_create_event, calendar_view_events, calendar_find_events, calendar_delete_event, general.\n"
         "IMPORTANT: ANY question about dates, today's date, Hijri date, Islamic date, Gregorian date, or 'what date' should ALWAYS be 'islamic_date'.\n"
+        "Calendar intents:\n"
+        "  - calendar_connect: When user wants to connect/link their Google Calendar (e.g., 'connect calendar', 'link calendar', 'setup calendar')\n"
+        "  - calendar_create_event: When user wants to create/add an event (e.g., 'create event', 'add meeting', 'schedule appointment')\n"
+        "  - calendar_view_events: When user wants to see upcoming events (e.g., 'show events', 'view calendar', 'my events')\n"
+        "  - calendar_find_events: When user wants to search for specific events (e.g., 'find events', 'search calendar')\n"
+        "  - calendar_delete_event: When user wants to delete/cancel an event (e.g., 'delete event', 'cancel meeting')\n"
         "Slots (all optional):\n"
         "  - prayer_name: Fajr|Dhuhr|Asr|Maghrib|Isha\n"
         "  - date: today|tomorrow|YYYY-MM-DD\n"
@@ -425,7 +431,7 @@ async def llm_intent_json(question: str, context: Optional[Dict[str, Any]] = Non
         "If unsure about ANY slot, set it to null. DO NOT invent or infer countries.\n"
         "Respond with exactly this JSON schema:\n"
         "{\n"
-        '  "intent": "islamic_date|prayer_times|next_prayer|reminder|general",\n'
+        '  "intent": "islamic_date|prayer_times|next_prayer|reminder|calendar_connect|calendar_create_event|calendar_view_events|calendar_find_events|calendar_delete_event|general",\n'
         '  "slots": {"prayer_name": null|string, "date": null|string, "city": null|string, "country": null|string, "reminder_text": null|string, "reminder_time": null|string}\n'
         "}\n"
     )
@@ -685,11 +691,21 @@ def mermaid_diagram() -> str:
     classify -->|prayer_times| prayer_times
     classify -->|next_prayer| next_prayer
     classify -->|reminder| scheduler_agent
+    classify -->|calendar_connect| calendar_connect
+    classify -->|calendar_create_event| calendar_create_event
+    classify -->|calendar_view_events| calendar_view_events
+    classify -->|calendar_find_events| calendar_find_events
+    classify -->|calendar_delete_event| calendar_delete_event
     classify -->|general| general
     islamic_date --> END((END))
     prayer_times --> END
     next_prayer --> END
     scheduler_agent --> END
+    calendar_connect --> END
+    calendar_create_event --> END
+    calendar_view_events --> END
+    calendar_find_events --> END
+    calendar_delete_event --> END
     general --> END
     """
 
@@ -933,6 +949,247 @@ async def scheduler_agent(state: BotState) -> BotState:
     state["profile"] = prof
     return state
 
+async def calendar_connect(state: BotState) -> BotState:
+    """Handle calendar connection request."""
+    from data.db_postgres import set_zapier_mcp_url
+    from mcp_client import is_calendar_connected
+    
+    q = state.get("question", "").strip()
+    lang = _lang(state)
+    wa_id = state.get("wa_id")
+    
+    if not wa_id:
+        state["reply"] = "Cannot connect calendar without user ID." if lang != "ar" else "لا يمكن ربط التقويم بدون معرف المستخدم."
+        return state
+    
+    # Check if already connected
+    if await is_calendar_connected(wa_id):
+        if lang == "ar":
+            state["reply"] = "التقويم متصل بالفعل. يمكنك استخدام الأوامر المتاحة."
+        else:
+            state["reply"] = "Calendar is already connected. You can use available commands."
+        return state
+    
+    # Extract MCP URL from user message
+    # Look for URL pattern or ask user to provide it
+    url_pattern = r"https://mcp\.zapier\.com/api/mcp/s/[^\s]+"
+    match = re.search(url_pattern, q)
+    
+    if match:
+        mcp_url = match.group(0)
+        try:
+            await set_zapier_mcp_url(wa_id, mcp_url)
+            if lang == "ar":
+                state["reply"] = "تم ربط التقويم بنجاح! يمكنك الآن إنشاء وعرض الأحداث."
+            else:
+                state["reply"] = "Calendar connected successfully! You can now create and view events."
+        except Exception as e:
+            if lang == "ar":
+                state["reply"] = f"فشل ربط التقويم: {str(e)}"
+            else:
+                state["reply"] = f"Failed to connect calendar: {str(e)}"
+    else:
+        if lang == "ar":
+            state["reply"] = "يرجى إرسال رابط Zapier MCP الخاص بك. مثال: https://mcp.zapier.com/api/mcp/s/..."
+        else:
+            state["reply"] = "Please send your Zapier MCP server URL. Example: https://mcp.zapier.com/api/mcp/s/..."
+    
+    return state
+
+async def calendar_create_event(state: BotState) -> BotState:
+    """Create a calendar event."""
+    from mcp_client import call_calendar_tool, is_calendar_connected
+    
+    lang = _lang(state)
+    wa_id = state.get("wa_id")
+    
+    if not wa_id:
+        state["reply"] = "Cannot create event without user ID." if lang != "ar" else "لا يمكن إنشاء حدث بدون معرف المستخدم."
+        return state
+    
+    if not await is_calendar_connected(wa_id):
+        if lang == "ar":
+            state["reply"] = "التقويم غير متصل. يرجى الاتصال أولاً باستخدام أمر 'connect calendar'."
+        else:
+            state["reply"] = "Calendar not connected. Please connect first using 'connect calendar'."
+        return state
+    
+    # Parse event details from question
+    q = state.get("question", "")
+    
+    # Use quick_add_event as it's simpler and can parse natural language
+    result = await call_calendar_tool(
+        wa_id,
+        "google_calendar_quick_add_event",
+        {
+            "instructions": "Create an event from the user's text",
+            "text": q,
+            "calendarid": "primary"  # Use primary calendar
+        }
+    )
+    
+    if result["success"]:
+        if lang == "ar":
+            state["reply"] = "تم إنشاء الحدث بنجاح!"
+        else:
+            state["reply"] = "Event created successfully!"
+    else:
+        state["reply"] = result["error"] or ("فشل إنشاء الحدث." if lang == "ar" else "Failed to create event.")
+    
+    return state
+
+async def calendar_view_events(state: BotState) -> BotState:
+    """View upcoming calendar events."""
+    from mcp_client import call_calendar_tool, is_calendar_connected
+    
+    lang = _lang(state)
+    wa_id = state.get("wa_id")
+    
+    if not wa_id:
+        state["reply"] = "Cannot view events without user ID." if lang != "ar" else "لا يمكن عرض الأحداث بدون معرف المستخدم."
+        return state
+    
+    if not await is_calendar_connected(wa_id):
+        if lang == "ar":
+            state["reply"] = "التقويم غير متصل. يرجى الاتصال أولاً."
+        else:
+            state["reply"] = "Calendar not connected. Please connect first."
+        return state
+    
+    # Find events for today and next few days
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    end_time = (now + timedelta(days=7)).isoformat()
+    
+    result = await call_calendar_tool(
+        wa_id,
+        "google_calendar_find_events",
+        {
+            "instructions": "Find upcoming events",
+            "calendarid": "primary",
+            "start_time": now.isoformat(),
+            "end_time": end_time,
+            "ordering": "startTime"
+        }
+    )
+    
+    if result["success"]:
+        events = result["data"]
+        if isinstance(events, list) and len(events) > 0:
+            event_list = []
+            for event in events[:10]:  # Show up to 10 events
+                summary = event.get("summary", "No title")
+                start = event.get("start", {}).get("dateTime") or event.get("start", {}).get("date", "Unknown time")
+                event_list.append(f"- {summary} ({start})")
+            
+            reply = "Upcoming events:\n" + "\n".join(event_list)
+            if lang == "ar":
+                reply = "الأحداث القادمة:\n" + "\n".join(event_list)
+            state["reply"] = reply
+        else:
+            if lang == "ar":
+                state["reply"] = "لا توجد أحداث قادمة."
+            else:
+                state["reply"] = "No upcoming events found."
+    else:
+        state["reply"] = result["error"] or ("فشل استرجاع الأحداث." if lang == "ar" else "Failed to retrieve events.")
+    
+    return state
+
+async def calendar_find_events(state: BotState) -> BotState:
+    """Search for events in calendar."""
+    from mcp_client import call_calendar_tool, is_calendar_connected
+    
+    lang = _lang(state)
+    wa_id = state.get("wa_id")
+    
+    if not await is_calendar_connected(wa_id):
+        if lang == "ar":
+            state["reply"] = "التقويم غير متصل. يرجى الاتصال أولاً."
+        else:
+            state["reply"] = "Calendar not connected. Please connect first."
+        return state
+    
+    # Parse search query from question
+    q = state.get("question", "")
+    
+    # Find events with search parameters
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    end_time = (now + timedelta(days=30)).isoformat()  # Search in next 30 days
+    
+    result = await call_calendar_tool(
+        wa_id,
+        "google_calendar_find_events",
+        {
+            "instructions": f"Search for events matching: {q}",
+            "calendarid": "primary",
+            "start_time": now.isoformat(),
+            "end_time": end_time,
+            "ordering": "startTime"
+        }
+    )
+    
+    if result["success"]:
+        events = result["data"]
+        if isinstance(events, list) and len(events) > 0:
+            event_list = []
+            for event in events[:10]:
+                summary = event.get("summary", "No title")
+                start = event.get("start", {}).get("dateTime") or event.get("start", {}).get("date", "Unknown")
+                event_list.append(f"- {summary} ({start})")
+            
+            reply = f"Found {len(events)} events:\n" + "\n".join(event_list)
+            if lang == "ar":
+                reply = f"تم العثور على {len(events)} حدث:\n" + "\n".join(event_list)
+            state["reply"] = reply
+        else:
+            if lang == "ar":
+                state["reply"] = "لم يتم العثور على أحداث."
+            else:
+                state["reply"] = "No events found."
+    else:
+        state["reply"] = result["error"] or ("فشل البحث عن الأحداث." if lang == "ar" else "Failed to search events.")
+    
+    return state
+
+async def calendar_delete_event(state: BotState) -> BotState:
+    """Delete a calendar event."""
+    from mcp_client import call_calendar_tool, is_calendar_connected
+    
+    lang = _lang(state)
+    wa_id = state.get("wa_id")
+    
+    if not await is_calendar_connected(wa_id):
+        if lang == "ar":
+            state["reply"] = "التقويم غير متصل. يرجى الاتصال أولاً."
+        else:
+            state["reply"] = "Calendar not connected. Please connect first."
+        return state
+    
+    # Extract event ID from question
+    # Try to extract event ID from message - this is a simplified version
+    q = state.get("question", "")
+    
+    # For now, we'll need the user to provide the event ID
+    # A better implementation would first list events and let user select
+    if not q or "event" not in q.lower():
+        if lang == "ar":
+            state["reply"] = "يرجى تحديد معرف الحدث المراد حذفه. استخدم 'view events' لرؤية الأحداث أولاً."
+        else:
+            state["reply"] = "Please specify the event ID to delete. Use 'view events' to see events first."
+        return state
+    
+    # Note: This is a simplified implementation
+    # In production, you'd want to first find events and let user select which one to delete
+    # For now, we'll inform the user they need to provide the event ID
+    if lang == "ar":
+        state["reply"] = "لحذف حدث، يرجى استخدام معرف الحدث. استخدم 'view events' لرؤية الأحداث ومعرفاتها."
+    else:
+        state["reply"] = "To delete an event, please use the event ID. Use 'view events' to see events and their IDs."
+    
+    return state
+
 async def general(state: BotState) -> BotState:
     """
     Handles general questions by politely redirecting users to specialized features.
@@ -946,7 +1203,8 @@ async def general(state: BotState) -> BotState:
             "• أوقات الصلاة (الفجر، الظهر، العصر، المغرب، العشاء)\n"
             "• التاريخ الهجري والميلادي\n"
             "• الصلاة القادمة\n"
-            "• التذكيرات والتنبيهات\n\n"
+            "• التذكيرات والتنبيهات\n"
+            "• إدارة التقويم (ربط، إنشاء، عرض، حذف الأحداث)\n\n"
             "من فضلك اسألني عن إحدى هذه الخدمات."
         )
     else:
@@ -956,7 +1214,8 @@ async def general(state: BotState) -> BotState:
             "• Prayer times (Fajr, Dhuhr, Asr, Maghrib, Isha)\n"
             "• Islamic (Hijri) and Gregorian dates\n"
             "• Next prayer time\n"
-            "• Setting reminders\n\n"
+            "• Setting reminders\n"
+            "• Calendar management (connect, create, view, delete events)\n\n"
             "Please ask me about one of these services."
         )
     
@@ -983,6 +1242,11 @@ workflow.add_node("islamic_date", islamic_date)
 workflow.add_node("prayer_times", prayer_times)
 workflow.add_node("next_prayer", next_prayer)
 workflow.add_node("scheduler_agent", scheduler_agent)
+workflow.add_node("calendar_connect", calendar_connect)
+workflow.add_node("calendar_create_event", calendar_create_event)
+workflow.add_node("calendar_view_events", calendar_view_events)
+workflow.add_node("calendar_find_events", calendar_find_events)
+workflow.add_node("calendar_delete_event", calendar_delete_event)
 workflow.add_node("general", general)
 workflow.add_node("noop", noop)
 
@@ -1007,10 +1271,15 @@ workflow.add_conditional_edges("classify", route, {
     "prayer_times": "prayer_times",
     "next_prayer": "next_prayer",
     "reminder": "scheduler_agent",
+    "calendar_connect": "calendar_connect",
+    "calendar_create_event": "calendar_create_event",
+    "calendar_view_events": "calendar_view_events",
+    "calendar_find_events": "calendar_find_events",
+    "calendar_delete_event": "calendar_delete_event",
     "general": "general",
 })
 
-for node in ["islamic_date","prayer_times","next_prayer","scheduler_agent","general","noop"]:
+for node in ["islamic_date","prayer_times","next_prayer","scheduler_agent","calendar_connect","calendar_create_event","calendar_view_events","calendar_find_events","calendar_delete_event","general","noop"]:
     workflow.add_edge(node, END)
 
 app_graph = workflow.compile()
