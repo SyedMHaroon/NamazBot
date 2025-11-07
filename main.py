@@ -413,7 +413,7 @@ async def llm_intent_json(question: str, context: Optional[Dict[str, Any]] = Non
         "Allowed intents: islamic_date, prayer_times, next_prayer, reminder, calendar_connect, calendar_create_event, calendar_view_events, calendar_find_events, calendar_delete_event, general.\n"
         "IMPORTANT: ANY question about dates, today's date, Hijri date, Islamic date, Gregorian date, or 'what date' should ALWAYS be 'islamic_date'.\n"
         "Calendar intents:\n"
-        "  - calendar_connect: When user wants to connect/link their Google Calendar (e.g., 'connect calendar', 'link calendar', 'setup calendar')\n"
+        "  - calendar_connect: When user wants to connect/link their Google Calendar OR disconnect/unlink it (e.g., 'connect calendar', 'link calendar', 'setup calendar', 'disconnect calendar', 'unlink calendar', 'remove calendar')\n"
         "  - calendar_create_event: When user wants to create/add an event (e.g., 'create event', 'add meeting', 'schedule appointment')\n"
         "  - calendar_view_events: When user wants to see upcoming events (e.g., 'show events', 'view calendar', 'my events')\n"
         "  - calendar_find_events: When user wants to search for specific events (e.g., 'find events', 'search calendar')\n"
@@ -950,55 +950,77 @@ async def scheduler_agent(state: BotState) -> BotState:
     return state
 
 async def calendar_connect(state: BotState) -> BotState:
-    """Handle calendar connection request."""
-    from data.db_postgres import set_zapier_mcp_url
-    from mcp_client import is_calendar_connected
+    """Handle calendar connection request - generates authorization URL or disconnects."""
+    from pipedream_client import is_calendar_connected, generate_auth_token, get_oauth_authorization_url
+    from data.db_postgres import clear_pipedream_connection_id
+    import os
     
-    q = state.get("question", "").strip()
     lang = _lang(state)
     wa_id = state.get("wa_id")
+    q = state.get("question", "").lower()
     
     if not wa_id:
         state["reply"] = "Cannot connect calendar without user ID." if lang != "ar" else "لا يمكن ربط التقويم بدون معرف المستخدم."
         return state
     
+    # Check if user wants to disconnect
+    if "disconnect" in q or "unlink" in q or "remove" in q:
+        if await is_calendar_connected(wa_id):
+            await clear_pipedream_connection_id(wa_id)
+            if lang == "ar":
+                state["reply"] = "تم قطع الاتصال بالتقويم بنجاح. يمكنك الاتصال مرة أخرى باستخدام 'connect calendar'."
+            else:
+                state["reply"] = "Calendar disconnected successfully. You can reconnect using 'connect calendar'."
+        else:
+            if lang == "ar":
+                state["reply"] = "التقويم غير متصل بالفعل."
+            else:
+                state["reply"] = "Calendar is not connected."
+        return state
+    
     # Check if already connected
     if await is_calendar_connected(wa_id):
         if lang == "ar":
-            state["reply"] = "التقويم متصل بالفعل. يمكنك استخدام الأوامر المتاحة."
+            state["reply"] = "التقويم متصل بالفعل. يمكنك استخدام الأوامر المتاحة. لإعادة الاتصال، استخدم 'disconnect calendar' ثم 'connect calendar'."
         else:
-            state["reply"] = "Calendar is already connected. You can use available commands."
+            state["reply"] = "Calendar is already connected. You can use available commands. To reconnect, use 'disconnect calendar' then 'connect calendar'."
         return state
     
-    # Extract MCP URL from user message
-    # Look for URL pattern or ask user to provide it
-    url_pattern = r"https://mcp\.zapier\.com/api/mcp/s/[^\s]+"
-    match = re.search(url_pattern, q)
-    
-    if match:
-        mcp_url = match.group(0)
-        try:
-            await set_zapier_mcp_url(wa_id, mcp_url)
-            if lang == "ar":
-                state["reply"] = "تم ربط التقويم بنجاح! يمكنك الآن إنشاء وعرض الأحداث."
-            else:
-                state["reply"] = "Calendar connected successfully! You can now create and view events."
-        except Exception as e:
-            if lang == "ar":
-                state["reply"] = f"فشل ربط التقويم: {str(e)}"
-            else:
-                state["reply"] = f"Failed to connect calendar: {str(e)}"
-    else:
+    # Generate authorization token and URL
+    try:
+        token = await generate_auth_token(wa_id)
+        auth_url = await get_oauth_authorization_url(wa_id, token)
+        
+        if not auth_url:
+            raise Exception("Failed to generate authorization URL")
+        
         if lang == "ar":
-            state["reply"] = "يرجى إرسال رابط Zapier MCP الخاص بك. مثال: https://mcp.zapier.com/api/mcp/s/..."
+            state["reply"] = (
+                "🔗 لربط التقويم، يرجى فتح الرابط التالي:\n\n"
+                f"{auth_url}\n\n"
+                "بعد فتح الرابط، سيتم توجيهك إلى صفحة التخويل."
+            )
         else:
-            state["reply"] = "Please send your Zapier MCP server URL. Example: https://mcp.zapier.com/api/mcp/s/..."
+            state["reply"] = (
+                "🔗 To connect your calendar, please open this link:\n\n"
+                f"{auth_url}\n\n"
+                "After opening the link, you'll be redirected to authorize your Google Calendar."
+            )
+    except Exception as e:
+        print(f"[ERROR] Failed to generate auth token: {e}")
+        if lang == "ar":
+            state["reply"] = "فشل إنشاء رابط التخويل. يرجى المحاولة مرة أخرى."
+        else:
+            state["reply"] = "Failed to generate authorization link. Please try again."
     
     return state
 
 async def calendar_create_event(state: BotState) -> BotState:
     """Create a calendar event."""
-    from mcp_client import call_calendar_tool, is_calendar_connected
+    from pipedream_client import (
+        is_calendar_connected,
+        trigger_workflow_create_event,
+    )
     
     lang = _lang(state)
     wa_id = state.get("wa_id")
@@ -1017,17 +1039,78 @@ async def calendar_create_event(state: BotState) -> BotState:
     # Parse event details from question
     q = state.get("question", "")
     
-    # Use quick_add_event as it's simpler and can parse natural language
-    result = await call_calendar_tool(
+    # Pre-process date/time references to make them more explicit
+    # Convert "today" to actual date, "tomorrow" to next day, etc.
+    from datetime import datetime, timedelta
+    import re
+    
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    tomorrow_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    # Replace "today" with actual date
+    q_processed = q.replace("today", today_str).replace("Tomorrow", tomorrow_str).replace("tomorrow", tomorrow_str)
+    
+    # If time is specified like "23:00 - 23:30", ensure it's clear it's today
+    # The quick_add_event tool should handle this, but let's make it explicit
+    if re.search(r'\d{1,2}:\d{2}', q_processed) and "today" not in q.lower() and "tomorrow" not in q.lower():
+        # If time is specified but no date, assume today
+        if not re.search(r'\d{4}-\d{2}-\d{2}', q_processed):
+            q_processed = f"{today_str} {q_processed}"
+    
+    print(f"[CALENDAR] Creating event for wa_id: {wa_id}, original text: {q}, processed text: {q_processed}")
+    
+    # Attempt to create event via workflow webhook (if configured)
+    workflow_payload = {
+        "original_text": q,
+        "processed_text": q_processed,
+        "calendar_id": "primary",
+        "language": lang,
+    }
+    workflow_result = await trigger_workflow_create_event(wa_id, workflow_payload)
+    if workflow_result.get("success"):
+        if lang == "ar":
+            state["reply"] = "تم إنشاء الحدث بنجاح!"
+        else:
+            state["reply"] = "Event created successfully!"
+        return state
+    elif not workflow_result.get("not_configured"):
+        # Workflow was configured but failed
+        error_msg = workflow_result.get("error") or "Unknown error"
+        if lang == "ar":
+            state["reply"] = f"فشل إنشاء الحدث عبر سير العمل. التفاصيل: {error_msg}"
+        else:
+            state["reply"] = f"Failed to create event via workflow. Details: {error_msg}"
+        return state
+    
+    # Fallback to MCP tools if workflow webhook is not configured
+    from pipedream_client import call_mcp_tool, list_mcp_tools
+    available_tools = await list_mcp_tools(wa_id)
+    print(f"[CALENDAR] Available MCP tools: {available_tools}")
+    
+    create_tool = None
+    for tool in available_tools:
+        if "create" in tool.lower() or "add" in tool.lower() or "event" in tool.lower():
+            create_tool = tool
+            break
+    
+    if not create_tool:
+        create_tool = "google_calendar_create_event"
+        if create_tool not in available_tools:
+            create_tool = "google_calendar_quick_add_event"
+    
+    print(f"[CALENDAR] Using tool: {create_tool}")
+    result = await call_mcp_tool(
         wa_id,
-        "google_calendar_quick_add_event",
+        create_tool,
         {
-            "instructions": "Create an event from the user's text",
-            "text": q,
-            "calendarid": "primary"  # Use primary calendar
+            "instructions": "Create an event from the user's text. Parse dates and times carefully.",
+            "text": q_processed,
+            "calendarid": "primary",
+            "original_text": q,
+            "processed_text": q_processed,
         }
     )
-    
     if result["success"]:
         if lang == "ar":
             state["reply"] = "تم إنشاء الحدث بنجاح!"
@@ -1035,12 +1118,11 @@ async def calendar_create_event(state: BotState) -> BotState:
             state["reply"] = "Event created successfully!"
     else:
         state["reply"] = result["error"] or ("فشل إنشاء الحدث." if lang == "ar" else "Failed to create event.")
-    
     return state
 
 async def calendar_view_events(state: BotState) -> BotState:
     """View upcoming calendar events."""
-    from mcp_client import call_calendar_tool, is_calendar_connected
+    from pipedream_client import call_mcp_tool, is_calendar_connected
     
     lang = _lang(state)
     wa_id = state.get("wa_id")
@@ -1059,22 +1141,51 @@ async def calendar_view_events(state: BotState) -> BotState:
     # Find events for today and next few days
     from datetime import datetime, timedelta
     now = datetime.now()
+    start_time = now.isoformat()
     end_time = (now + timedelta(days=7)).isoformat()
     
-    result = await call_calendar_tool(
+    print(f"[CALENDAR] Viewing events for wa_id: {wa_id}, start: {start_time}, end: {end_time}")
+    
+    # List available tools first to find the correct tool name
+    from pipedream_client import list_mcp_tools
+    available_tools = await list_mcp_tools(wa_id)
+    print(f"[CALENDAR] Available MCP tools: {available_tools}")
+    
+    # Try to find a tool for finding/listing events
+    find_tool = None
+    for tool in available_tools:
+        if "find" in tool.lower() or "list" in tool.lower() or "search" in tool.lower() or "event" in tool.lower():
+            find_tool = tool
+            break
+    
+    if not find_tool:
+        # Fallback to common tool names
+        find_tool = "google_calendar_find_events"  # Try this first
+        if find_tool not in available_tools:
+            find_tool = "google_calendar_list_events"  # Fallback
+    
+    print(f"[CALENDAR] Using tool: {find_tool}")
+    
+    result = await call_mcp_tool(
         wa_id,
-        "google_calendar_find_events",
+        find_tool,
         {
             "instructions": "Find upcoming events",
             "calendarid": "primary",
-            "start_time": now.isoformat(),
+            "start_time": start_time,
             "end_time": end_time,
             "ordering": "startTime"
         }
     )
     
+    print(f"[CALENDAR] View events result: success={result.get('success')}, error={result.get('error')}")
+    
     if result["success"]:
         events = result["data"]
+        # Handle different response formats
+        if isinstance(events, dict):
+            events = events.get("items", []) or events.get("events", []) or []
+        
         if isinstance(events, list) and len(events) > 0:
             event_list = []
             for event in events[:10]:  # Show up to 10 events
@@ -1098,7 +1209,7 @@ async def calendar_view_events(state: BotState) -> BotState:
 
 async def calendar_find_events(state: BotState) -> BotState:
     """Search for events in calendar."""
-    from mcp_client import call_calendar_tool, is_calendar_connected
+    from pipedream_client import call_mcp_tool, is_calendar_connected
     
     lang = _lang(state)
     wa_id = state.get("wa_id")
@@ -1118,9 +1229,29 @@ async def calendar_find_events(state: BotState) -> BotState:
     now = datetime.now()
     end_time = (now + timedelta(days=30)).isoformat()  # Search in next 30 days
     
-    result = await call_calendar_tool(
+    # List available tools first to find the correct tool name
+    from pipedream_client import list_mcp_tools
+    available_tools = await list_mcp_tools(wa_id)
+    print(f"[CALENDAR] Available MCP tools: {available_tools}")
+    
+    # Try to find a tool for finding/listing events
+    find_tool = None
+    for tool in available_tools:
+        if "find" in tool.lower() or "list" in tool.lower() or "search" in tool.lower() or "event" in tool.lower():
+            find_tool = tool
+            break
+    
+    if not find_tool:
+        # Fallback to common tool names
+        find_tool = "google_calendar_find_events"  # Try this first
+        if find_tool not in available_tools:
+            find_tool = "google_calendar_list_events"  # Fallback
+    
+    print(f"[CALENDAR] Using tool: {find_tool}")
+    
+    result = await call_mcp_tool(
         wa_id,
-        "google_calendar_find_events",
+        find_tool,
         {
             "instructions": f"Search for events matching: {q}",
             "calendarid": "primary",
@@ -1155,7 +1286,7 @@ async def calendar_find_events(state: BotState) -> BotState:
 
 async def calendar_delete_event(state: BotState) -> BotState:
     """Delete a calendar event."""
-    from mcp_client import call_calendar_tool, is_calendar_connected
+    from pipedream_client import call_mcp_tool, is_calendar_connected
     
     lang = _lang(state)
     wa_id = state.get("wa_id")

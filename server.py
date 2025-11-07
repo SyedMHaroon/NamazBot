@@ -4,8 +4,8 @@ import re
 from typing import Any, Dict, List, Tuple, Optional
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import FastAPI, Request, Form, Query
+from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse, RedirectResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -42,6 +42,7 @@ VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "")
 WHATSAPP_TOKEN   = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID", "")
 WABASE = "https://graph.facebook.com/v20.0"
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")  # Your server base URL
 
 app = FastAPI()
 
@@ -115,6 +116,260 @@ async def whatsapp_verify(request: Request):
     ):
         return PlainTextResponse(params["hub.challenge"])
     return PlainTextResponse("Verification failed", status_code=403)
+
+# ========== Calendar Authorization ==========
+@app.get("/auth/calendar/{token}", response_class=HTMLResponse)
+async def calendar_auth_page(token: str):
+    """Redirect user to Pipedream OAuth authorization."""
+    from pipedream_client import get_wa_id_from_token, get_oauth_authorization_url
+    
+    # Verify token
+    wa_id = await get_wa_id_from_token(token)
+    if not wa_id:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Authorization Expired</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                .error { color: #d32f2f; }
+            </style>
+        </head>
+        <body>
+            <h1 class="error">Authorization Link Expired</h1>
+            <p>The authorization link has expired. Please request a new link from the bot.</p>
+        </body>
+        </html>
+        """, status_code=400)
+    
+    # Get Pipedream OAuth authorization URL
+    auth_url = await get_oauth_authorization_url(wa_id, token)
+    if not auth_url:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Connection Error</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                .error { color: #d32f2f; }
+            </style>
+        </head>
+        <body>
+            <h1 class="error">Connection Error</h1>
+            <p>Failed to generate authorization URL. Please try again.</p>
+        </body>
+        </html>
+        """, status_code=500)
+    
+    # Redirect to Pipedream OAuth
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=auth_url, status_code=302)
+
+
+@app.get("/auth/pipedream/callback", response_class=HTMLResponse)
+async def pipedream_callback(
+    token: Optional[str] = Query(None),
+    code: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    connection_id: Optional[str] = Query(None),
+    account_id: Optional[str] = Query(None)
+):
+    """Callback endpoint that receives OAuth callback from Pipedream and stores connection ID."""
+    from pipedream_client import get_wa_id_from_token, invalidate_auth_token
+    from data.db_postgres import set_pipedream_connection_id
+    from wa_client import send_whatsapp_text
+    
+    # Handle OAuth errors
+    if error:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Authorization Failed</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                .error { color: #d32f2f; background: #ffebee; padding: 20px; border-radius: 8px; display: inline-block; }
+            </style>
+        </head>
+        <body>
+            <div class="error">
+                <h1>Authorization Failed</h1>
+                <p>You declined to authorize the connection. Please try again.</p>
+            </div>
+        </body>
+        </html>
+        """, status_code=400)
+    
+    # Verify token
+    if not token:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Invalid Request</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                .error { color: #d32f2f; }
+            </style>
+        </head>
+        <body>
+            <h1 class="error">Invalid Request</h1>
+            <p>Missing authorization token. Please try again.</p>
+        </body>
+        </html>
+        """, status_code=400)
+    
+    wa_id = await get_wa_id_from_token(token)
+    if not wa_id:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Authorization Expired</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                .error { color: #d32f2f; background: #ffebee; padding: 20px; border-radius: 8px; display: inline-block; }
+            </style>
+        </head>
+        <body>
+            <div class="error">
+                <h1>Authorization Link Expired</h1>
+                <p>The authorization link has expired. Please request a new link from the bot.</p>
+            </div>
+        </body>
+        </html>
+        """, status_code=400)
+    
+    try:
+        # For Pipedream Connect, after user authorizes, Pipedream redirects back
+        # Pipedream might return account_id (apn_*) in the callback query params
+        # This is the connected account ID that we need to store and use in MCP calls
+        
+        # Check callback query params for account_id
+        # Pipedream might return it as account_id or in the query string
+        account_id_from_callback = account_id
+        
+        # If not in query params, check if it's in the code parameter
+        if not account_id_from_callback and code:
+            # Sometimes Pipedream returns account_id in code parameter
+            if code.startswith("apn_"):
+                account_id_from_callback = code
+        
+        # Store account_id (apn_*) - this is what we use in x-pd-account-id header
+        # If not provided, query Pipedream API to get it
+        if account_id_from_callback:
+            await set_pipedream_connection_id(wa_id, account_id_from_callback)
+            print(f"[PIPEDREAM] Stored account_id: {account_id_from_callback} for wa_id: {wa_id}")
+        else:
+            # Query Pipedream API to get account_id after authorization
+            from pipedream_client import get_account_id_for_user
+            print(f"[PIPEDREAM] Querying Pipedream API for account_id for wa_id: {wa_id}")
+            account_id_from_api = await get_account_id_for_user(wa_id)
+            
+            if account_id_from_api:
+                await set_pipedream_connection_id(wa_id, account_id_from_api)
+                print(f"[PIPEDREAM] Stored account_id from API: {account_id_from_api} for wa_id: {wa_id}")
+            else:
+                print(f"[PIPEDREAM] WARNING: No account_id found in callback or API. Query params: token={token}, code={code}, connection_id={connection_id}, account_id={account_id}")
+                # Store wa_id as temporary identifier (will need to be updated)
+                await set_pipedream_connection_id(wa_id, wa_id)
+        
+        # Invalidate token (one-time use)
+        await invalidate_auth_token(token)
+        
+        # Send WhatsApp confirmation
+        try:
+            await send_whatsapp_text(
+                wa_id,
+                "✅ Calendar connected successfully! You can now create and view events. Try saying 'create event' or 'view events'."
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to send WhatsApp confirmation: {e}")
+        
+        # Return success page
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Calendar Connected</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * { box-sizing: border-box; }
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    margin: 0;
+                    padding: 20px;
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .container {
+                    background: white;
+                    border-radius: 12px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    padding: 40px;
+                    max-width: 500px;
+                    width: 100%;
+                    text-align: center;
+                }
+                .success-icon {
+                    font-size: 64px;
+                    margin-bottom: 20px;
+                }
+                h1 {
+                    color: #2e7d32;
+                    margin-top: 0;
+                    font-size: 28px;
+                }
+                p {
+                    color: #666;
+                    font-size: 16px;
+                    line-height: 1.6;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="success-icon">✅</div>
+                <h1>Calendar Connected!</h1>
+                <p>Your Google Calendar has been successfully connected.</p>
+                <p>You can now close this page and return to WhatsApp to use calendar features.</p>
+            </div>
+        </body>
+        </html>
+        """)
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to store connection ID: {e}")
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Connection Failed</title>
+            <meta charset="utf-8">
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                .error { color: #d32f2f; background: #ffebee; padding: 20px; border-radius: 8px; display: inline-block; }
+            </style>
+        </head>
+        <body>
+            <div class="error">
+                <h1>Connection Failed</h1>
+                <p>An error occurred while connecting your calendar. Please try again.</p>
+            </div>
+        </body>
+        </html>
+        """, status_code=500)
 
 # ========== helpers ==========
 def extract_text(msg: Dict[str, Any]) -> str:

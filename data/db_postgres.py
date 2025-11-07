@@ -37,7 +37,7 @@ class User(Base):
     country = Column(String(120))
     tz = Column(String(120))          # e.g., "Asia/Karachi"
     lang = Column(String(5))          # 'en' | 'ar'
-    zapier_mcp_url = Column(Text, nullable=True)  # Zapier MCP server URL for Google Calendar
+    pipedream_connection_id = Column(String(255), nullable=True)  # Pipedream connection ID for Google Calendar
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -84,7 +84,7 @@ async def get_user(wa_id: str) -> Optional[Dict[str, Any]]:
         q = await session.execute(
             text(
                 """
-                SELECT id, wa_id, name, email, city, country, tz, lang, zapier_mcp_url, created_at, updated_at
+                SELECT id, wa_id, name, email, city, country, tz, lang, pipedream_connection_id, created_at, updated_at
                 FROM users WHERE wa_id = :wa_id
                 """
             ),
@@ -216,24 +216,35 @@ async def trim_messages_to(wa_id: str, keep: int = 10) -> int:
         return deleted.rowcount if (deleted.rowcount or 0) > 0 else 0
 
 
-# ---------- Zapier MCP URL management ----------
-async def get_zapier_mcp_url(wa_id: str) -> Optional[str]:
-    """Get Zapier MCP URL for a user."""
+# ---------- Pipedream Connection ID management ----------
+async def get_pipedream_connection_id(wa_id: str) -> Optional[str]:
+    """Get Pipedream connection ID for a user."""
     async with SessionLocal() as session:
         res = await session.execute(
-            select(User.zapier_mcp_url).where(User.wa_id == wa_id)
+            select(User.pipedream_connection_id).where(User.wa_id == wa_id)
         )
         return res.scalar_one_or_none()
 
 
-async def set_zapier_mcp_url(wa_id: str, mcp_url: str) -> None:
-    """Set Zapier MCP URL for a user."""
+async def set_pipedream_connection_id(wa_id: str, connection_id: str) -> None:
+    """Set Pipedream connection ID for a user."""
     async with SessionLocal() as session:
         await session.execute(
-            text("UPDATE users SET zapier_mcp_url = :url, updated_at = NOW() WHERE wa_id = :wa_id"),
-            {"url": mcp_url, "wa_id": wa_id}
+            text("UPDATE users SET pipedream_connection_id = :conn_id, updated_at = NOW() WHERE wa_id = :wa_id"),
+            {"conn_id": connection_id, "wa_id": wa_id}
         )
         await session.commit()
+
+
+async def clear_pipedream_connection_id(wa_id: str) -> None:
+    """Clear/disconnect Pipedream connection ID for a user."""
+    async with SessionLocal() as session:
+        await session.execute(
+            text("UPDATE users SET pipedream_connection_id = NULL, updated_at = NOW() WHERE wa_id = :wa_id"),
+            {"wa_id": wa_id}
+        )
+        await session.commit()
+        print(f"[PIPEDREAM] Cleared connection ID for wa_id: {wa_id}")
 
 
 # ---------- Back-compat aliases (so older imports keep working) ----------
